@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test output
+*.test
+*.test.exe
+*.out
+coverage.html
+
+# Temporary
+*.tmp
+*.log
+__debug_bin*
+
+# Documentation (not needed in image)
+README.md
+LICENSE
+CONTRIBUTING.md
+RELEASING.md
+
+# CI/CD
+.github/
+.claude/
