@@ -25,6 +25,29 @@ const (
 	ErrCodeInternalError      uint16 = 0x0051
 )
 
+// codeMessages maps error codes to human-readable descriptions.
+var codeMessages = map[uint16]string{
+	ErrCodeUnknownAction:         "unknown action",
+	ErrCodeBufferTooShort:        "buffer too short",
+	ErrCodeInvalidLength:         "invalid frame length",
+	ErrCodeStreamNotFound:        "stream not found",
+	ErrCodeStreamAlreadyExists:   "stream already exists",
+	ErrCodeStreamFull:            "stream is full (max messages or bytes reached)",
+	ErrCodeStreamFilterOverlap:   "stream subject filter overlaps with existing stream",
+	ErrCodeSubjectNotFound:       "subject not found",
+	ErrCodeIdempotencyDuplicate:  "duplicate message (idempotency window)",
+	ErrCodeConsumerNotFound:      "consumer not found",
+	ErrCodeConsumerAlreadyExists: "consumer already exists",
+	ErrCodeConsumerFilterOverlap: "consumer filter overlaps with existing consumer",
+	ErrCodeInvalidSequence:       "invalid sequence number",
+	ErrCodeMaxInflightReached:    "max inflight reached",
+	ErrCodeAckTimeout:            "ack timeout exceeded",
+	ErrCodeAuthRequired:          "authentication required",
+	ErrCodeAuthFailed:            "authentication failed",
+	ErrCodeServerShuttingDown:    "server shutting down",
+	ErrCodeInternalError:         "internal server error",
+}
+
 // ArbitroError represents an error from the broker or client.
 type ArbitroError struct {
 	Code    uint16
@@ -34,6 +57,9 @@ type ArbitroError struct {
 func (e *ArbitroError) Error() string {
 	if e.Message != "" {
 		return fmt.Sprintf("arbitro: [0x%04X] %s", e.Code, e.Message)
+	}
+	if msg, ok := codeMessages[e.Code]; ok {
+		return fmt.Sprintf("arbitro: [0x%04X] %s", e.Code, msg)
 	}
 	return fmt.Sprintf("arbitro: error code 0x%04X", e.Code)
 }

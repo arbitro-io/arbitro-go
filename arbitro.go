@@ -222,9 +222,15 @@ func (c *Client) prefixed(subject string) string {
 }
 
 func (c *Client) checkReply(frame []byte) error {
+	if len(frame) < proto.HeaderSize {
+		return &ArbitroError{Code: ErrCodeInternalError, Message: "reply frame too short"}
+	}
 	hdr := proto.DecodeHeader(frame)
 	if hdr.Action == proto.ActionRepError {
 		body := frame[proto.HeaderSize:]
+		if len(body) < 10 {
+			return &ArbitroError{Code: ErrCodeInternalError, Message: "malformed error reply"}
+		}
 		code := proto.RepErrorCode(body)
 		return &ArbitroError{Code: code}
 	}

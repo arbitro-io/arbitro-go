@@ -26,6 +26,9 @@ func (c *Client) CreateStream(ctx context.Context, name string, cfg StreamConfig
 		return nil, err
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "create stream: reply body too short"}
+	}
 	streamID := uint32(proto.RepOkRefSeq(body))
 	c.streams.set(name, streamID)
 	return &Stream{client: c, name: name, streamID: streamID}, nil
