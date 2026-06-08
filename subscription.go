@@ -45,6 +45,7 @@ func (s *Subscription) Fetch(ctx context.Context, count int) ([]*Msg, error) {
 func (s *Subscription) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.client.unregisterSubscription(s.consumerID)
 		// Send Unsubscribe frame
 		seq := s.client.conn.NextSeq()
 		frame, _ := proto.EncodeUnsubscribe(seq, s.consumerID)
@@ -99,15 +100,13 @@ func (m *Msg) Dup() bool {
 	return hdr.Flags&proto.FlagDup != 0
 }
 
-// Ack acknowledges the message (fire-and-forget to broker).
+// Ack acknowledges the message (batched for throughput — flushed every 1ms or 64 acks).
 func (m *Msg) Ack() {
 	if m.acked {
 		return
 	}
 	m.acked = true
-	seq := m.client.conn.NextSeq()
-	frame := proto.EncodeAck(seq, m.consumerID, m.subjectHash, m.seq)
-	_ = m.client.conn.Send(frame)
+	m.client.conn.AckBatch.Ack(m.consumerID, m.subjectHash, m.seq)
 	m.client.acksSent.Add(1)
 }
 
@@ -258,11 +257,12 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 	return consumerID, nil
 }
 
-// subscriptions stores active subscription dispatch by consumer_id.
-var subscriptions sync.Map // map[uint32]*Subscription
-
 func (c *Client) registerSubscription(consumerID uint32, sub *Subscription) {
-	subscriptions.Store(consumerID, sub)
+	c.subs.Store(consumerID, sub)
+}
+
+func (c *Client) unregisterSubscription(consumerID uint32) {
+	c.subs.Delete(consumerID)
 }
 
 func bytesArr(b []byte) []int {

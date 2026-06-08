@@ -179,6 +179,87 @@ func BenchmarkThroughput1K(b *testing.B) {
 	b.SetBytes(256 * msgCount)
 }
 
+// BenchmarkPublishBatchAsync measures fire-and-forget batch publish throughput.
+// This mirrors the Rust throughput bench: batch-256, fire-and-forget, write coalescing.
+func BenchmarkPublishBatchAsync(b *testing.B) {
+	client := benchClient(b)
+	ctx := context.Background()
+	stream := benchStream(b, client)
+
+	// Pre-resolve stream ID for zero-overhead path
+	streamID, err := client.ResolveStreamID(ctx, stream)
+	if err != nil {
+		b.Fatalf("resolve stream id: %v", err)
+	}
+
+	payload := make([]byte, 64)
+	entries := make([]arbitro.BatchEntry, 256)
+	for i := range entries {
+		entries[i] = arbitro.BatchEntry{
+			Subject: stream + ".batch",
+			Payload: payload,
+		}
+	}
+
+	b.ResetTimer()
+	b.SetBytes(64 * 256)
+
+	for i := 0; i < b.N; i++ {
+		client.PublishBatchAsync(stream, entries)
+	}
+	b.StopTimer()
+	// Final sync to ensure all frames are flushed — outside timing.
+	_ = client.Publish(ctx, stream, stream+".flush", payload)
+	_ = streamID
+}
+
+// BenchmarkPublishFireAndForget measures the raw fire-and-forget path
+// with pre-resolved stream ID (equivalent to Rust's client.publish()).
+func BenchmarkPublishFireAndForget(b *testing.B) {
+	client := benchClient(b)
+	stream := benchStream(b, client)
+
+	ctx := context.Background()
+	streamID, err := client.ResolveStreamID(ctx, stream)
+	if err != nil {
+		b.Fatalf("resolve stream id: %v", err)
+	}
+
+	payload := make([]byte, 64)
+	subject := stream + ".fire"
+
+	b.ResetTimer()
+	b.SetBytes(64)
+
+	for i := 0; i < b.N; i++ {
+		_ = client.PublishFireAndForget(streamID, subject, payload)
+	}
+}
+
+// BenchmarkPublishParallelFireAndForget measures concurrent fire-and-forget from N goroutines.
+func BenchmarkPublishParallelFireAndForget(b *testing.B) {
+	client := benchClient(b)
+	stream := benchStream(b, client)
+
+	ctx := context.Background()
+	streamID, err := client.ResolveStreamID(ctx, stream)
+	if err != nil {
+		b.Fatalf("resolve stream id: %v", err)
+	}
+
+	payload := make([]byte, 64)
+	subject := stream + ".parallel"
+
+	b.ResetTimer()
+	b.SetBytes(64)
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = client.PublishFireAndForget(streamID, subject, payload)
+		}
+	})
+}
+
 // --- chaos/stress ---
 
 func TestChaosRapidConnectDisconnect(t *testing.T) {

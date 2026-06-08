@@ -92,4 +92,5 @@ type MetricsSnapshot struct {
 	Reconnects      uint64
 	PendingRequests uint64
 	ActiveSubs      uint64
+	BatchFramesRecv uint64
 }

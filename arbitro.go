@@ -18,6 +18,7 @@ package arbitro
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,6 +93,7 @@ func (c *Client) Metrics() MetricsSnapshot {
 		Reconnects:      c.reconnects.Load(),
 		PendingRequests: uint64(c.conn.PendingLen()),
 		ActiveSubs:      c.activeSubs.Load(),
+		BatchFramesRecv: c.conn.BatchRecv.Load(),
 	}
 }
 
@@ -121,6 +123,7 @@ func (c *Client) Publish(ctx context.Context, stream, subject string, payload []
 }
 
 // PublishAsync sends a message without waiting for confirmation (fire-and-forget).
+// Uses the write channel — no mutex, no syscall on the calling goroutine.
 func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...PublishOption) {
 	po := publishOptions{}
 	for _, fn := range opts {
@@ -131,6 +134,38 @@ func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...Pu
 	subj := c.prefixed(subject)
 	seq := c.conn.NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subj), []byte(po.msgID), payload, proto.FlagNone)
+	_ = c.conn.Send(frame)
+	c.publishesSent.Add(1)
+}
+
+// PublishFireAndForget is the fastest publish path — uses a pre-resolved stream ID,
+// no options parsing, no string conversion overhead. Equivalent to Rust's publish().
+func (c *Client) PublishFireAndForget(streamID uint32, subject string, payload []byte) error {
+	seq := c.conn.NextSeq()
+	frame := proto.EncodePublish(seq, streamID, []byte(subject), nil, payload, proto.FlagNone)
+	err := c.conn.Send(frame)
+	if err == nil {
+		c.publishesSent.Add(1)
+	}
+	return err
+}
+
+// PublishBatchAsync sends a batch of messages without waiting for confirmation.
+// Equivalent to Rust's publish_batch() — fire-and-forget, write-coalesced.
+func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
+	streamID, _ := c.streams.get(stream)
+
+	protoEntries := make([]proto.BatchEntry, len(entries))
+	for i := range entries {
+		protoEntries[i] = proto.BatchEntry{
+			Subject: []byte(c.prefixed(entries[i].Subject)),
+			MsgID:   []byte(entries[i].MsgID),
+			Payload: entries[i].Payload,
+		}
+	}
+
+	seq := c.conn.NextSeq()
+	frame := proto.EncodePublishBatch(seq, streamID, protoEntries, proto.FlagNone)
 	_ = c.conn.Send(frame)
 	c.publishesSent.Add(1)
 }
@@ -215,6 +250,12 @@ func (c *Client) Request(ctx context.Context, stream, subject string, payload []
 	return nil, nil
 }
 
+// ResolveStreamID resolves the stream name to its broker-assigned numeric ID.
+// Cache the result and pass it to PublishFireAndForget for maximum throughput.
+func (c *Client) ResolveStreamID(ctx context.Context, stream string) (uint32, error) {
+	return c.resolveStreamID(ctx, stream)
+}
+
 // --- helpers ---
 
 func (c *Client) prefixed(subject string) string {
@@ -287,8 +328,136 @@ func (c *Client) resolveConsumerID(ctx context.Context, streamID uint32, name st
 }
 
 func (c *Client) handleDeliver(frame []byte) {
+	if len(frame) < proto.HeaderSize {
+		return
+	}
+
+	hdr := proto.DecodeHeader(frame)
+
+	switch hdr.Action {
+	case proto.ActionDeliver:
+		c.dispatchSingleDeliver(frame, hdr)
+	case proto.ActionRepBatch, proto.ActionFanoutBatch:
+		c.dispatchBatchDeliver(frame[proto.HeaderSize:])
+	}
+}
+
+func (c *Client) dispatchSingleDeliver(frame []byte, hdr proto.Header) {
 	c.deliveriesRecv.Add(1)
-	// Dispatch to subscription layer (will be wired in subscription.go)
+
+	if len(frame) < proto.HeaderSize+proto.DeliverBodyOffset {
+		return
+	}
+
+	body := frame[proto.HeaderSize:]
+	dh := proto.DecodeDeliverHeader(body)
+
+	sub := c.lookupSub(dh.ConsumerID)
+	if sub == nil {
+		return
+	}
+
+	subjOff := proto.HeaderSize + proto.DeliverBodyOffset
+	subjLen := int(dh.SubjectLen)
+	payloadOff := subjOff + subjLen
+	payloadLen := len(frame) - payloadOff
+
+	msg := &Msg{
+		frame:       frame,
+		consumerID:  dh.ConsumerID,
+		subjectHash: dh.SubjectHash,
+		seq:         hdr.Seq,
+		subjectOff:  subjOff,
+		subjectLen:  subjLen,
+		payloadOff:  payloadOff,
+		payloadLen:  payloadLen,
+		client:      c,
+	}
+
+	c.deliverToSub(sub, msg)
+}
+
+func (c *Client) dispatchBatchDeliver(body []byte) {
+	if len(body) < 4 {
+		return
+	}
+	count := int(binary.LittleEndian.Uint16(body[0:2]))
+	off := 4 // skip count(2) + pad(2)
+
+	for i := 0; i < count; i++ {
+		if off+24 > len(body) {
+			break
+		}
+		// Entry header: consumer_id(4) + seq(8) + subj_len(2) + reply_len(2) + data_len(4) + subject_hash(4) = 24
+		consumerID := binary.LittleEndian.Uint32(body[off : off+4])
+		seq := binary.LittleEndian.Uint64(body[off+4 : off+12])
+		subjLen := int(binary.LittleEndian.Uint16(body[off+12 : off+14]))
+		replyLen := int(binary.LittleEndian.Uint16(body[off+14 : off+16]))
+		dataLen := int(binary.LittleEndian.Uint32(body[off+16 : off+20]))
+		subjectHash := binary.LittleEndian.Uint32(body[off+20 : off+24])
+
+		entryPayloadStart := off + 24
+		// data_len = total variable tail (subject + reply_to + payload)
+		totalTail := dataLen
+		if entryPayloadStart+totalTail > len(body) {
+			break
+		}
+
+		c.deliveriesRecv.Add(1)
+
+		sub := c.lookupSub(consumerID)
+		if sub == nil {
+			off = entryPayloadStart + totalTail
+			continue
+		}
+
+		// Build Msg referencing the batch buffer slice
+		subjOff := entryPayloadStart
+		payloadOff := entryPayloadStart + subjLen + replyLen
+		payloadLen := dataLen - subjLen - replyLen
+
+		msg := &Msg{
+			frame:       body, // reference batch buffer
+			consumerID:  consumerID,
+			subjectHash: subjectHash,
+			seq:         seq,
+			subjectOff:  subjOff,
+			subjectLen:  subjLen,
+			payloadOff:  payloadOff,
+			payloadLen:  payloadLen,
+			client:      c,
+		}
+
+		c.deliverToSub(sub, msg)
+		off = entryPayloadStart + totalTail
+	}
+}
+
+func (c *Client) lookupSub(consumerID uint32) *Subscription {
+	val, ok := c.subs.Load(consumerID)
+	if !ok {
+		return nil
+	}
+	return val.(*Subscription)
+}
+
+func (c *Client) deliverToSub(sub *Subscription, msg *Msg) {
+	// Callback mode — invoke directly on reader goroutine (zero-alloc hot path)
+	if sub.handler != nil {
+		sub.handler(msg)
+		return
+	}
+
+	// Channel mode — try non-blocking first, then block with close guard
+	select {
+	case sub.ch <- msg:
+	case <-sub.closed:
+	default:
+		select {
+		case sub.ch <- msg:
+		case <-sub.closed:
+		}
+	}
 }
 
 // randomToken generates a simple unique token for reply-to subjects.

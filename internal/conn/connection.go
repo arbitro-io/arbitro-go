@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,19 +20,23 @@ type Connection struct {
 	conn    net.Conn
 	seq     atomic.Uint64
 	pending *PendingMap
-	writeMu sync.Mutex
+
+	// Channel-based writer — replaces writeMu for lock-free publish path.
+	writeCh chan []byte
+
+	// Ack batcher — batches individual acks into BatchAck frames.
+	AckBatch *AckBatcher
 
 	// Subscription dispatch: consumer_id → handler
-	handlers   sync.Map // map[uint32]DeliverHandler
-	onDeliver  func(frame []byte) // raw frame dispatch (for subscription layer)
+	onDeliver func(frame []byte) // raw frame dispatch (for subscription layer)
 
-	closed  atomic.Bool
-	done    chan struct{}
+	// Diagnostics
+	BatchRecv atomic.Uint64
+
+	closed atomic.Bool
+	done   chan struct{}
 	timeout time.Duration
 }
-
-// DeliverHandler is called for each Deliver frame routed to a consumer.
-type DeliverHandler func(frame []byte)
 
 // Config holds connection parameters.
 type Config struct {
@@ -53,16 +56,23 @@ func Dial(ctx context.Context, cfg Config) (*Connection, error) {
 		addr:    cfg.Addr,
 		conn:    conn,
 		pending: NewPendingMap(),
+		writeCh: make(chan []byte, writeQueueCap),
 		done:    make(chan struct{}),
 		timeout: cfg.Timeout,
 	}
 	c.seq.Store(1)
 
-	// Send handshake
+	// Send handshake (direct write before writer goroutine starts)
 	if err := c.sendHello(); err != nil {
 		conn.Close()
 		return nil, err
 	}
+
+	// Start writer goroutine (drains writeCh → coalesced TCP writes)
+	go writeLoop(conn, c.writeCh, c.done)
+
+	// Start ack batcher (batches individual acks → BatchAck frames)
+	c.AckBatch = NewAckBatcher(c)
 
 	// Start read loop
 	go c.readLoop()
@@ -75,15 +85,23 @@ func (c *Connection) NextSeq() uint64 {
 	return c.seq.Add(1) - 1
 }
 
-// Send writes a raw frame to the connection (thread-safe).
+// Send enqueues a frame for writing (non-blocking, lock-free hot path).
 func (c *Connection) Send(frame []byte) error {
 	if c.closed.Load() {
 		return errors.New("arbitro: connection closed")
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_, err := c.conn.Write(frame)
-	return err
+	select {
+	case c.writeCh <- frame:
+		return nil
+	default:
+		// Channel full — apply backpressure (blocking send with close guard).
+		select {
+		case c.writeCh <- frame:
+			return nil
+		case <-c.done:
+			return errors.New("arbitro: connection closed")
+		}
+	}
 }
 
 // SendExpectReply sends a frame and waits for the broker's reply (correlated by seq).
@@ -151,25 +169,44 @@ func (c *Connection) readLoop() {
 	reader := bufio.NewReaderSize(c.conn, 65536)
 
 	for {
-		// Read header
+		// Read 16-byte header (same size for both v2 Header and Envelope)
 		headerBuf := make([]byte, proto.HeaderSize)
 		if _, err := io.ReadFull(reader, headerBuf); err != nil {
 			return
 		}
 
-		hdr := proto.DecodeHeader(headerBuf)
+		// Peek action to determine header format
+		action := binary.LittleEndian.Uint16(headerBuf[0:2])
+
+		var hdr proto.Header
+		var msgLen uint32
+
+		if proto.IsEnvelopeAction(action) {
+			// Envelope format: msg_len at offset 8-11
+			env := proto.DecodeEnvelope(headerBuf)
+			msgLen = env.MsgLen
+			// Convert to Header for dispatch compatibility
+			hdr = proto.Header{
+				Action: env.Action,
+				Flags:  env.Flags,
+				MsgLen: env.MsgLen,
+			}
+		} else {
+			hdr = proto.DecodeHeader(headerBuf)
+			msgLen = hdr.MsgLen
+		}
 
 		// Read body
 		var body []byte
-		if hdr.MsgLen > 0 {
-			body = make([]byte, hdr.MsgLen)
+		if msgLen > 0 {
+			body = make([]byte, msgLen)
 			if _, err := io.ReadFull(reader, body); err != nil {
 				return
 			}
 		}
 
 		// Build full frame for dispatch
-		frame := make([]byte, proto.HeaderSize+int(hdr.MsgLen))
+		frame := make([]byte, proto.HeaderSize+int(msgLen))
 		copy(frame, headerBuf)
 		if body != nil {
 			copy(frame[proto.HeaderSize:], body)
@@ -191,9 +228,9 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 		}
 
 	case proto.ActionRepBatch, proto.ActionFanoutBatch:
-		// Fanout batch: dispatch each entry as a virtual deliver
+		// Batch delivery: dispatch each entry
 		if c.onDeliver != nil {
-			c.dispatchBatch(body)
+			c.dispatchBatch(frame, body)
 		}
 
 	case proto.ActionPong:
@@ -202,40 +239,14 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 	case proto.ActionCronFire:
 		// Cron fire: resolve via pending (uses seq correlation)
 		c.pending.Resolve(hdr.Seq, frame)
+
 	}
 }
 
-func (c *Connection) dispatchBatch(body []byte) {
-	if len(body) < 4 {
-		return
-	}
-	count := binary.LittleEndian.Uint16(body[0:2])
-	off := 4 // skip count(2) + pad(2)
-
-	for i := 0; i < int(count); i++ {
-		if off+24 > len(body) {
-			break
-		}
-		// Entry: consumer_id(4) + deliver_seq(8) + subject_len(2) + reply_len(2) + data_len(4) + subject_hash(4)
-		dataLen := binary.LittleEndian.Uint32(body[off+16 : off+20])
-		entryEnd := off + 24 + int(dataLen)
-		if entryEnd > len(body) {
-			break
-		}
-		// Reconstruct as a synthetic Deliver frame for the handler
-		// For now, pass the raw batch frame — subscription layer handles it
-		off = entryEnd
-	}
-
-	// Pass entire batch frame to the deliver handler for batch processing
+func (c *Connection) dispatchBatch(frame, body []byte) {
+	c.BatchRecv.Add(1)
+	// Pass the full frame (including envelope header) to the deliver handler
 	if c.onDeliver != nil {
-		// The subscription layer distinguishes batch vs single by checking action in header
-		fullFrame := make([]byte, proto.HeaderSize+len(body))
-		proto.EncodeHeader(fullFrame, proto.Header{
-			Action: proto.ActionRepBatch,
-			MsgLen: uint32(len(body)),
-		})
-		copy(fullFrame[proto.HeaderSize:], body)
-		c.onDeliver(fullFrame)
+		c.onDeliver(frame)
 	}
 }

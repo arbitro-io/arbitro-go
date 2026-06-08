@@ -33,5 +33,5 @@ func connectT(t *testing.T) *arbitro.Client {
 }
 
 func uniqueName(prefix string) string {
-	return prefix + "-" + time.Now().Format("150405.000")
+	return prefix + "-" + time.Now().Format("150405-000")
 }
