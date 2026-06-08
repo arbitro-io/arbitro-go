@@ -163,6 +163,9 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 	}
 
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "publish batch: reply body too short"}
+	}
 	firstSeq := proto.RepOkRefSeq(body)
 	return firstSeq, nil
 }
@@ -255,9 +258,32 @@ func (c *Client) resolveStreamID(ctx context.Context, name string) (uint32, erro
 		return 0, err
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "get stream: reply body too short"}
+	}
 	id := uint32(proto.RepOkRefSeq(body))
 	c.streams.set(name, id)
 	return id, nil
+}
+
+func (c *Client) resolveConsumerID(ctx context.Context, streamID uint32, name string) (uint32, error) {
+	seq := c.conn.NextSeq()
+	frame, err := proto.EncodeGetConsumer(seq, streamID, []byte(name))
+	if err != nil {
+		return 0, err
+	}
+	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	if err != nil {
+		return 0, err
+	}
+	if err := c.checkReply(reply); err != nil {
+		return 0, err
+	}
+	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "get consumer: reply body too short"}
+	}
+	return uint32(proto.RepOkRefSeq(body)), nil
 }
 
 func (c *Client) handleDeliver(frame []byte) {

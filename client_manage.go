@@ -84,6 +84,9 @@ func (c *Client) StreamInfo(ctx context.Context, name string) (*StreamInfo, erro
 		return nil, err
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "stream info: reply body too short"}
+	}
 	id := uint32(proto.RepOkRefSeq(body))
 	c.streams.set(name, id)
 	return &StreamInfo{Name: name, StreamID: id}, nil
@@ -131,6 +134,9 @@ func (c *Client) PurgeStream(ctx context.Context, name string) (uint64, error) {
 		return 0, err
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "purge stream: reply body too short"}
+	}
 	return proto.RepOkRefSeq(body), nil
 }
 
@@ -149,6 +155,9 @@ func (c *Client) DrainSubject(ctx context.Context, stream, subject string) (uint
 		return 0, err
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "drain subject: reply body too short"}
+	}
 	return proto.RepOkRefSeq(body), nil
 }
 
@@ -167,6 +176,9 @@ func (c *Client) DeleteMessage(ctx context.Context, stream string, msgSeq uint64
 		return false, nil // not found / already deleted
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return false, nil
+	}
 	return proto.RepOkRefSeq(body) > 0, nil
 }
 

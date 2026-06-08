@@ -244,12 +244,16 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 		return 0, err
 	}
 	if err := c.checkReply(reply); err != nil {
-		// If already exists, that's fine — get the ID
 		if !IsAlreadyExists(err) {
 			return 0, err
 		}
+		// Consumer exists — resolve its real ID via GetConsumer
+		return c.resolveConsumerID(ctx, streamID, name)
 	}
 	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "create consumer: reply body too short"}
+	}
 	consumerID := uint32(proto.RepOkRefSeq(body))
 	return consumerID, nil
 }
