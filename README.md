@@ -7,7 +7,7 @@ Full parity with the Rust and TypeScript clients, leveraging Go's concurrency pr
 ## Requirements
 
 - Go 1.22+
-- Arbitro broker reachable on `127.0.0.1:9898` or your own `--addr`
+- Arbitro broker reachable on `127.0.0.1:9898`
 
 ## Install
 
@@ -15,17 +15,15 @@ Full parity with the Rust and TypeScript clients, leveraging Go's concurrency pr
 go get github.com/arbitro-io/arbitro-go
 ```
 
-## Run the broker locally (Docker)
-
-The broker ships as a public Docker image (musl-static, ~3 MB, scratch base):
+## Run the Broker (Docker)
 
 ```bash
 docker run --rm -p 9898:9898 ghcr.io/arbitro-io/arbitro-server:latest
 ```
 
-Pin a major/minor tag for production:
+Pin a version tag for production:
 
-- `ghcr.io/arbitro-io/arbitro-server:0.5.0` -- immutable release tag
+- `ghcr.io/arbitro-io/arbitro-server:0.5.3` -- immutable release tag
 - `ghcr.io/arbitro-io/arbitro-server:0.5`   -- auto-updates within `0.5.*`
 - `ghcr.io/arbitro-io/arbitro-server:latest` -- latest tagged release
 
@@ -37,7 +35,6 @@ package main
 import (
     "context"
     "fmt"
-    "time"
 
     "github.com/arbitro-io/arbitro-go"
 )
@@ -48,17 +45,14 @@ func main() {
     client, _ := arbitro.Connect(ctx, "127.0.0.1:9898")
     defer client.Close()
 
-    // Create stream
     client.CreateStream(ctx, "orders", arbitro.StreamConfig{
         SubjectFilter: "orders.>",
         MaxMsgs:       100_000,
         Journal:       arbitro.JournalTolerant,
     })
 
-    // Publish
     client.Publish(ctx, "orders", "orders.created", []byte(`{"id":1}`))
 
-    // Subscribe
     sub, _ := client.Subscribe(ctx, "orders", arbitro.ConsumerConfig{
         Name:   "workers",
         Filter: "orders.>",
@@ -108,7 +102,7 @@ response, err := client.Request(ctx, "orders", "orders.validate", requestPayload
 ## Subscribe
 
 ```go
-// Channel-based (Go's killer feature)
+// Channel-based
 sub, _ := client.Subscribe(ctx, "orders", arbitro.ConsumerConfig{
     Name:   "workers",
     Filter: "orders.>",
@@ -119,7 +113,7 @@ for msg := range sub.Messages() {
     msg.Ack()
 }
 
-// Multi-stream fan-in with select (impossible in Rust/TS without extra libs)
+// Multi-stream fan-in with select
 select {
 case msg := <-ordersSub.Messages():
     processOrder(msg)
@@ -131,7 +125,7 @@ case <-ctx.Done():
     return
 }
 
-// Callback mode (zero-alloc hot path, no channel overhead)
+// Callback mode (no channel overhead)
 sub, _ := client.Subscribe(ctx, "orders", cfg,
     arbitro.WithHandler(func(msg *arbitro.Msg) {
         process(msg.Data())
@@ -145,8 +139,6 @@ msgs, _ := sub.Fetch(ctx, 10)
 
 ## Per-Subject Inflight Limits
 
-`MaxSubjectInflights` caps the in-flight (delivered, unacked) count per subject pattern, with full wildcard support (`*`, `>`). The strongest flow-control feature in the system.
-
 ```go
 _, _ = client.CreateConsumer(ctx, "orders", arbitro.ConsumerConfig{
     Name:        "workers",
@@ -156,8 +148,8 @@ _, _ = client.CreateConsumer(ctx, "orders", arbitro.ConsumerConfig{
     AckWait:     30 * time.Second,
     MaxDeliver:  5,
     MaxSubjectInflights: []arbitro.SubjectLimit{
-        {Pattern: "orders.priority.>", Limit: 1},   // serialize VIP
-        {Pattern: "orders.bulk.>", Limit: 100},      // high concurrency
+        {Pattern: "orders.priority.>", Limit: 1},
+        {Pattern: "orders.bulk.>", Limit: 100},
     },
 })
 ```
@@ -198,7 +190,7 @@ pending, _ := client.GetPending(ctx, "orders", "workers")
 
 ## Cron Scheduling
 
-Register distributed cron jobs with queue semantics -- multiple workers, single delivery per fire.
+Distributed cron jobs with queue semantics -- multiple workers, single delivery per fire.
 
 ```go
 handle, _ := client.Cron("daily-report").
@@ -213,11 +205,11 @@ handle, _ := client.Cron("daily-report").
 handle.Stop(ctx)
 ```
 
-Crons re-register automatically on reconnect. No persistence -- if the broker restarts, clients re-register their crons when they reconnect.
+Crons re-register automatically on reconnect.
 
 ## Workflow / Saga
 
-Client-side linear pipelines over Arbitro streams. The broker has no workflow-specific code -- everything uses streams, consumer groups, and idempotent publish.
+Client-side workflow pipelines over Arbitro streams. The broker has no workflow-specific code -- everything uses streams, consumer groups, and idempotent publish.
 
 ```go
 wf, _ := client.Workflow("order-process").
@@ -227,29 +219,42 @@ wf, _ := client.Workflow("order-process").
     Compensate("validate", rollbackValidation).
     Step("charge", chargeFn).
     Compensate("charge", refundFn).
+    SuspendStep("payment-auth", prepareAuthFn).
+    OnTimeout(handleTimeoutFn).
     Step("ship", shipFn).
     MaxRetries(3).
     AckWait(30 * time.Second).
     MaxInflight(10).
     Start(ctx)
 
+// Trigger
 instanceID, _ := wf.Trigger(ctx, payload)
+
+// Trigger with explicit ID (dedup-safe)
+wf.TriggerWithID(ctx, []byte("order-123"), payload)
+
+// Resume a suspended instance
+wf.Resume(ctx, []byte("order-123"), authResultPayload)
+
+// Cancel a running or suspended instance
+wf.Cancel(ctx, []byte("order-123"))
+
+// Source: external stream triggers
+wf2, _ := client.Workflow("event-driven").
+    Source("external-events").
+    Step("process", processFn).
+    Start(ctx)
+
 wf.Stop(ctx)
 ```
 
 ## Delayed Publish
 
-Schedule message delivery for the future:
-
 ```go
 err := client.PublishDelayed(ctx, "orders", "orders.reminder", payload, 5*time.Second)
 ```
 
-Messages are persisted immediately -- survives broker restart.
-
 ## Metrics
-
-The client tracks atomic counters readable via `client.Metrics()`. Use it as a saturation gauge for dashboards or alerts.
 
 ```go
 m := client.Metrics()
@@ -265,8 +270,6 @@ m := client.Metrics()
 
 ## Message Type
 
-Zero-copy delivery. `Data()` and `SubjectBytes()` are slices into the frame buffer -- no heap allocation on the hot path.
-
 ```go
 msg.Subject()      // string
 msg.SubjectBytes() // []byte (zero-alloc)
@@ -274,10 +277,10 @@ msg.Data()         // []byte (zero-copy into frame buffer)
 msg.Seq()          // uint64
 msg.ConsumerID()   // uint32
 msg.Dup()          // bool (redelivery flag)
-msg.Ack()          // explicit ack (batched: flushes every 1ms or 64 acks)
+msg.Ack()          // explicit ack (batched)
 msg.Nack()         // immediate requeue
 msg.NackDelay(d)   // delayed requeue
-msg.Copy()         // MsgCopy (heap-safe, escapes frame buffer lifecycle)
+msg.Copy()         // MsgCopy (heap-safe)
 ```
 
 ## Connection Options
@@ -292,53 +295,9 @@ client, _ := arbitro.Connect(ctx, "127.0.0.1:9898",
 )
 ```
 
-## Performance
-
-Write coalescing + channel-based architecture matching the Rust client's `writer_task` pattern.
-
-| Benchmark | ns/op | MB/s | msgs/s | allocs/op |
-|-----------|------:|-----:|--------:|----------:|
-| PublishSync | 33,735 | 3.8 | 30K | 7 |
-| PublishAsync | 398 | 322 | 2.5M | 2 |
-| PublishFireAndForget | 493 | 130 | 2.0M | 1 |
-| PublishBatchAsync (x256) | 33,508 | 489 | 7.7M | 260 |
-| ParallelFireAndForget (24 cores) | 391 | 164 | 2.6M | 1 |
-
-Measured on i9-12900K, 24 threads, broker on same machine, 64-byte payload.
-
-Key optimizations:
-- **Write coalescing**: single writer goroutine drains channel, flushes all pending frames in one syscall
-- **Lock-free publish**: `Send()` is a non-blocking channel write (no mutex on hot path)
-- **Ack batching**: individual acks accumulate and flush as BatchAck frames every 1ms or 64 entries
-- **Zero-copy delivery**: `Msg.Data()` returns a slice into the frame buffer, no allocation
-
 ## Replication
 
 Replication is transparent to the client -- `Replicas` is set at `CreateStream` time. The client publishes normally; the broker handles replication internally.
-
-## Testing
-
-```bash
-# Unit tests (no broker needed)
-go test ./internal/... -v -race
-
-# Integration tests (broker must be running on :9898)
-go test ./tests/... -v -race -tags=integration -timeout=60s
-
-# Benchmarks
-go test -run=^$ -bench=. -benchmem -tags=integration ./tests/
-```
-
-## Go Advantages
-
-| Pattern | Go | Rust | TS |
-|---------|:--:|:----:|:--:|
-| Multi-stream select | Native `select{}` | `tokio::select!` macro | `Promise.race` |
-| Fire-and-forget | `PublishAsync` | Separate API split | Unhandled promise |
-| Graceful shutdown | `context.Context` | `CancellationToken` | No standard |
-| Worker pool | N goroutines ranging channel | Manual tokio::spawn | Worker threads |
-| Zero-copy + safe | `Msg.Copy()` escape hatch | Borrow checker | GC (no zero-copy) |
-| Race detection | `go test -race` | miri (slow) | None |
 
 ## License
 

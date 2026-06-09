@@ -214,7 +214,7 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 		name = stream
 	}
 	group := cfg.Group
-	if group == "" {
+	if !cfg.Fanout && group == "" {
 		group = name
 	}
 
@@ -226,11 +226,16 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 		}
 	}
 
+	var deliverMode uint32 = 1 // Queue
+	if cfg.Fanout {
+		deliverMode = 0 // Fanout
+	}
+
 	seq := c.conn.NextSeq()
 	frame, err := proto.EncodeCreateConsumer(
 		seq, streamID,
 		[]byte(name), []byte(group), []byte(c.prefixed(cfg.Filter)),
-		cfg.MaxInflight, cfg.AckPolicy, cfg.DeliverPolicy, 0,
+		cfg.MaxInflight, cfg.AckPolicy, cfg.DeliverPolicy, deliverMode,
 		uint32(cfg.AckWait.Milliseconds()), cfg.StartSeq,
 		subjectLimits,
 	)
