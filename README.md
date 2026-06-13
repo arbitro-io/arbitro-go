@@ -219,8 +219,32 @@ wf, _ := client.Workflow("order-process").
     Compensate("validate", rollbackValidation).
     Step("charge", chargeFn).
     Compensate("charge", refundFn).
-    SuspendStep("payment-auth", prepareAuthFn).
-    OnTimeout(handleTimeoutFn).
+    SuspendStep("payment-auth", 30_000,
+        // run: return OutcomeSuspend to park the instance
+        func(ctx StepContext) (StepOutcome, error) {
+            state, err := prepareAuth(ctx.Input)
+            if err != nil {
+                return StepOutcome{}, err
+            }
+            return OutcomeSuspend(state, 30_000), nil
+        },
+        // onResume: called when wf.Resume() delivers an external event
+        func(rctx ResumeContext) (StepResult, error) {
+            result, err := processAuthResult(rctx.State, rctx.Event)
+            if err != nil {
+                return StepResult{}, err
+            }
+            return StepResult{Context: result}, nil
+        },
+    ).
+    // onTimeout: called if 30s pass without resume
+    OnTimeout(func(tctx TimeoutContext) (StepResult, error) {
+        cancelled, err := cancelAuth(tctx.State)
+        if err != nil {
+            return StepResult{}, err
+        }
+        return StepResult{Context: cancelled}, nil
+    }).
     Step("ship", shipFn).
     MaxRetries(3).
     AckWait(30 * time.Second).
@@ -231,17 +255,17 @@ wf, _ := client.Workflow("order-process").
 instanceID, _ := wf.Trigger(ctx, payload)
 
 // Trigger with explicit ID (dedup-safe)
-wf.TriggerWithID(ctx, []byte("order-123"), payload)
+wf.TriggerWithID(ctx, "order-123", payload)
 
 // Resume a suspended instance
-wf.Resume(ctx, []byte("order-123"), authResultPayload)
+wf.Resume(ctx, "order-123", authResultPayload)
 
 // Cancel a running or suspended instance
-wf.Cancel(ctx, []byte("order-123"))
+wf.Cancel(ctx, "order-123")
 
-// Source: external stream triggers
+// Source: external stream triggers (streamName + subject)
 wf2, _ := client.Workflow("event-driven").
-    Source("external-events").
+    Source("external-events", "events.>").
     Step("process", processFn).
     Start(ctx)
 
