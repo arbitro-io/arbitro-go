@@ -23,6 +23,7 @@ const (
 	ErrCodeAuthFailed         uint16 = 0x0041
 	ErrCodeServerShuttingDown uint16 = 0x0050
 	ErrCodeInternalError      uint16 = 0x0051
+	ErrCodeTimeout            uint16 = 0x00FF // client-side timeout (not from broker)
 )
 
 // codeMessages maps error codes to human-readable descriptions.

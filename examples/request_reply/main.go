@@ -1,4 +1,4 @@
-// Example: request/reply RPC pattern.
+// Example: request/reply RPC pattern using the Service abstraction.
 package main
 
 import (
@@ -22,32 +22,25 @@ func main() {
 	}
 	defer client.Close()
 
-	_, err = client.CreateStream(ctx, "services", arbitro.StreamConfig{
-		SubjectFilter: "services.>",
-		MaxMsgs:       100_000,
-		Journal:       arbitro.JournalTolerant,
-	})
-	if err != nil && !arbitro.IsAlreadyExists(err) {
+	// Build a service — creates backing stream + consumer automatically
+	svc, err := client.Service("calculator").Build(ctx)
+	if err != nil {
 		log.Fatal(err)
 	}
+	defer svc.Close()
 
-	// Request/Reply — blocks in goroutine, no callback hell
-	response, err := client.Request(ctx, "services", "services.validate", []byte(`{"order":"123"}`), 5*time.Second)
+	// Register handlers
+	svc.Handle("add", func(msg *arbitro.Msg) {
+		result := fmt.Sprintf("result: %s + ok", msg.Data())
+		msg.Reply([]byte(result))
+		msg.Ack()
+	})
+
+	// Make a request to ourselves (same service)
+	resp, err := svc.Request(ctx, "calculator", "add", []byte("1+2"), 5*time.Second)
 	if err != nil {
-		fmt.Printf("request error (expected if no responder): %v\n", err)
+		fmt.Printf("request error: %v\n", err)
 	} else {
-		fmt.Printf("response: %s\n", response)
-	}
-
-	// Fire-and-forget with PublishAsync (Go advantage: no Future/Promise needed)
-	client.PublishAsync("services", "services.audit", []byte(`{"action":"validate","order":"123"}`))
-	fmt.Println("async audit event sent")
-
-	// Delayed publish — broker delivers after duration
-	err = client.PublishDelayed(ctx, "services", "services.reminder", []byte(`{"msg":"follow up"}`), 5*time.Second)
-	if err != nil {
-		fmt.Printf("delayed publish: %v\n", err)
-	} else {
-		fmt.Println("delayed message scheduled for 5s from now")
+		fmt.Printf("response: %s\n", resp)
 	}
 }

@@ -95,9 +95,40 @@ client.PublishBatchAsync("orders", entries)
 // Delayed -- delivered after duration
 err = client.PublishDelayed(ctx, "orders", "orders.reminder", payload, 30*time.Second)
 
-// Request/Reply -- RPC
+// Request/Reply -- see Service section below for the full RPC pattern
 response, err := client.Request(ctx, "orders", "orders.validate", requestPayload, 5*time.Second)
 ```
+
+## Publish with Headers
+
+Attach arbitrary key-value metadata to messages. Headers are persisted alongside the payload and stripped on delivery -- consumers always receive only the user payload.
+
+```go
+// Custom headers (tracing, routing metadata)
+err := client.Publish(ctx, "orders", "orders.created", payload,
+    arbitro.WithHeaders(map[string]string{
+        "trace-id": "abc-123",
+        "source":   "checkout-svc",
+    }),
+)
+
+// Headers + dedup
+err = client.Publish(ctx, "orders", "orders.created", payload,
+    arbitro.WithMsgID("order-abc-123"),
+    arbitro.WithHeaders(map[string]string{
+        "priority": "high",
+        "region":   "us-east-1",
+    }),
+)
+
+// Batch with per-entry headers
+firstSeq, err := client.PublishBatch(ctx, "orders", []arbitro.BatchEntry{
+    {Subject: "orders.a", Payload: payloadA, Headers: map[string]string{"priority": "high"}},
+    {Subject: "orders.b", Payload: payloadB, Headers: map[string]string{"priority": "low"}},
+})
+```
+
+Headers use a zero-copy TLV wire format -- no serialization overhead. The broker persists them with the entry and strips them at delivery time. The client handles `string` → `[]byte` conversion internally.
 
 ## Subscribe
 
@@ -136,6 +167,43 @@ sub, _ := client.Subscribe(ctx, "orders", cfg,
 // Pull-based fetch (N messages with timeout)
 msgs, _ := sub.Fetch(ctx, 10)
 ```
+
+## Service (Request/Reply RPC)
+
+Build named services with automatic stream/consumer creation, handler dispatch, and correlated request/reply.
+
+```go
+ctx := context.Background()
+
+// Build a service — creates backing stream + consumer automatically
+svc, _ := client.Service("calculator").SetMaxInflight(1024).Build(ctx)
+defer svc.Close()
+
+// Register method handlers
+svc.Handle("add", func(msg *arbitro.Msg) {
+    result := compute(msg.Data())
+    msg.Reply([]byte(fmt.Sprintf("sum=%d", result)))
+    msg.Ack()
+})
+
+svc.Handle("multiply", func(msg *arbitro.Msg) {
+    msg.Reply([]byte(fmt.Sprintf("product=%d", computeMul(msg.Data()))))
+    msg.Ack()
+})
+
+// Send a request to another service (or self)
+response, err := svc.Request(ctx, "calculator", "add", []byte("2+3"), 5*time.Second)
+fmt.Println(string(response)) // "sum=5"
+
+// Fire-and-forget
+svc.Send(ctx, "audit", "log", []byte("event-data"))
+
+// Cross-service RPC (Go advantage: blocks in goroutine, no callback hell)
+gateway, _ := client.Service("gateway").Build(ctx)
+resp, _ := gateway.Request(ctx, "calculator", "multiply", []byte("3*4"), 5*time.Second)
+```
+
+`msg.Reply()` always works -- no need to check for reply_to presence.
 
 ## Per-Subject Inflight Limits
 
@@ -220,7 +288,6 @@ wf, _ := client.Workflow("order-process").
     Step("charge", chargeFn).
     Compensate("charge", refundFn).
     SuspendStep("payment-auth", 30_000,
-        // run: return OutcomeSuspend to park the instance
         func(ctx StepContext) (StepOutcome, error) {
             state, err := prepareAuth(ctx.Input)
             if err != nil {
@@ -228,7 +295,6 @@ wf, _ := client.Workflow("order-process").
             }
             return OutcomeSuspend(state, 30_000), nil
         },
-        // onResume: called when wf.Resume() delivers an external event
         func(rctx ResumeContext) (StepResult, error) {
             result, err := processAuthResult(rctx.State, rctx.Event)
             if err != nil {
@@ -237,7 +303,6 @@ wf, _ := client.Workflow("order-process").
             return StepResult{Context: result}, nil
         },
     ).
-    // onTimeout: called if 30s pass without resume
     OnTimeout(func(tctx TimeoutContext) (StepResult, error) {
         cancelled, err := cancelAuth(tctx.State)
         if err != nil {
@@ -298,6 +363,8 @@ m := client.Metrics()
 msg.Subject()      // string
 msg.SubjectBytes() // []byte (zero-alloc)
 msg.Data()         // []byte (zero-copy into frame buffer)
+msg.ReplyTo()      // []byte (reply_to field, nil if none)
+msg.Reply(payload) // send response (decodes reply_to automatically)
 msg.Seq()          // uint64
 msg.ConsumerID()   // uint32
 msg.Dup()          // bool (redelivery flag)

@@ -19,6 +19,7 @@ package arbitro
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,10 @@ type Client struct {
 	// Cron registry
 	cronMu sync.Mutex
 	crons  map[string]*cronEntry
+
+	// Request/reply correlation (standalone, outside Service)
+	reqCorrID  atomic.Uint64
+	reqPending sync.Map // map[uint64]chan []byte
 
 	// metrics
 	publishesSent  atomic.Uint64
@@ -224,30 +229,45 @@ func (c *Client) PublishDelayed(ctx context.Context, stream, subject string, pay
 	return c.checkReply(reply)
 }
 
-// Request performs a request/reply RPC. Publishes with a reply-to subject and waits.
+// Request performs a request/reply RPC using the service correlation pattern.
+// The stream must already have a service registered (via client.Service(name).Build()).
+// For standalone request/reply without a full service, use Service.Request() directly.
 func (c *Client) Request(ctx context.Context, stream, subject string, payload []byte, timeout time.Duration) ([]byte, error) {
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
 
+	corrID := c.reqCorrID.Add(1)
 	subj := c.prefixed(subject)
-	replyTo := []byte("_INBOX." + randomToken())
+	replySubject := fmt.Sprintf("_reply.%s.%d", stream, corrID)
+
+	replyTo := make([]byte, 5+len(replySubject))
+	replyTo[0] = ReplyToMagic
+	binary.LittleEndian.PutUint32(replyTo[1:5], streamID)
+	copy(replyTo[5:], replySubject)
+
 	seq := c.conn.NextSeq()
 	frame := proto.EncodePublishWithReply(seq, streamID, []byte(subj), replyTo, nil, payload, proto.FlagAckReq)
+
+	ch := make(chan []byte, 1)
+	c.reqPending.Store(corrID, ch)
+	defer c.reqPending.Delete(corrID)
 
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	reply, err := c.conn.SendExpectReply(tctx, frame, seq)
+	_, err = c.conn.SendExpectReply(tctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.checkReply(reply); err != nil {
-		return nil, err
+
+	select {
+	case data := <-ch:
+		return data, nil
+	case <-tctx.Done():
+		return nil, &ArbitroError{Code: ErrCodeTimeout, Message: "request timeout"}
 	}
-	// TODO: wait for actual reply message on _INBOX subject
-	return nil, nil
 }
 
 // ResolveStreamID resolves the stream name to its broker-assigned numeric ID.
@@ -413,6 +433,7 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 
 		// Build Msg referencing the batch buffer slice
 		subjOff := entryPayloadStart
+		replyToOff := entryPayloadStart + subjLen
 		payloadOff := entryPayloadStart + subjLen + replyLen
 		payloadLen := dataLen - subjLen - replyLen
 
@@ -423,6 +444,8 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 			seq:         seq,
 			subjectOff:  subjOff,
 			subjectLen:  subjLen,
+			replyToOff:  replyToOff,
+			replyToLen:  replyLen,
 			payloadOff:  payloadOff,
 			payloadLen:  payloadLen,
 			client:      c,
@@ -460,8 +483,3 @@ func (c *Client) deliverToSub(sub *Subscription, msg *Msg) {
 	}
 }
 
-// randomToken generates a simple unique token for reply-to subjects.
-func randomToken() string {
-	// Simple counter-based token — sufficient for correlation
-	return "go" + time.Now().Format("150405.000000000")
-}

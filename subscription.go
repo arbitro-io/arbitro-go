@@ -2,6 +2,7 @@ package arbitro
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"time"
 
@@ -55,6 +56,9 @@ func (s *Subscription) Close() {
 	})
 }
 
+// ReplyToMagic is the leading byte of an encoded reply_to field.
+const ReplyToMagic = 0xFF
+
 // Msg represents a delivered message. Zero-copy: Subject/Data are slices into the frame buffer.
 type Msg struct {
 	frame       []byte
@@ -63,6 +67,8 @@ type Msg struct {
 	seq         uint64
 	subjectOff  int
 	subjectLen  int
+	replyToOff  int
+	replyToLen  int
 	payloadOff  int
 	payloadLen  int
 	client      *Client
@@ -82,6 +88,29 @@ func (m *Msg) SubjectBytes() []byte {
 // Data returns the message payload (zero-copy slice into frame buffer).
 func (m *Msg) Data() []byte {
 	return m.frame[m.payloadOff : m.payloadOff+m.payloadLen]
+}
+
+// ReplyTo returns the raw reply_to bytes (empty if none).
+func (m *Msg) ReplyTo() []byte {
+	if m.replyToLen == 0 {
+		return nil
+	}
+	return m.frame[m.replyToOff : m.replyToOff+m.replyToLen]
+}
+
+// Reply sends a response to the requester by decoding the reply_to field.
+// Format: [0xFF][stream_id LE u32][subject bytes].
+// No-op if there is no reply_to or the format is invalid.
+func (m *Msg) Reply(payload []byte) {
+	rt := m.ReplyTo()
+	if len(rt) < 6 || rt[0] != ReplyToMagic {
+		return
+	}
+	targetStreamID := binary.LittleEndian.Uint32(rt[1:5])
+	replySubject := rt[5:]
+	seq := m.client.conn.NextSeq()
+	frame := proto.EncodePublish(seq, targetStreamID, replySubject, nil, payload, proto.FlagAckReq)
+	_ = m.client.conn.Send(frame)
 }
 
 // Seq returns the delivery sequence number.
