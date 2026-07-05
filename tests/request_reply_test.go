@@ -41,9 +41,8 @@ func TestRequestReplyRoundTrip(t *testing.T) {
 	defer svc.Close()
 
 	// Register echo handler
-	svc.Handle("ping", func(msg *arbitro.Msg) {
-		msg.Reply(append([]byte("pong:"), msg.Data()...))
-		msg.Ack()
+	svc.Handle("ping", func(req *arbitro.Request) ([]byte, error) {
+		return append([]byte("pong:"), req.Data()...), nil
 	})
 
 	// Send request
@@ -66,13 +65,11 @@ func TestServiceMultipleHandlers(t *testing.T) {
 	}
 	defer svc.Close()
 
-	svc.Handle("add", func(msg *arbitro.Msg) {
-		msg.Reply([]byte("added"))
-		msg.Ack()
+	svc.Handle("add", func(req *arbitro.Request) ([]byte, error) {
+		return []byte("added"), nil
 	})
-	svc.Handle("sub", func(msg *arbitro.Msg) {
-		msg.Reply([]byte("subtracted"))
-		msg.Ack()
+	svc.Handle("sub", func(req *arbitro.Request) ([]byte, error) {
+		return []byte("subtracted"), nil
 	})
 
 	resp1, err := svc.Request(ctx, "multi-svc", "add", []byte("1"), 5*time.Second)
@@ -102,9 +99,8 @@ func TestServiceConcurrentRequests(t *testing.T) {
 	}
 	defer svc.Close()
 
-	svc.Handle("echo", func(msg *arbitro.Msg) {
-		msg.Reply(msg.Data())
-		msg.Ack()
+	svc.Handle("echo", func(req *arbitro.Request) ([]byte, error) {
+		return req.Data(), nil
 	})
 
 	var wg sync.WaitGroup
@@ -138,9 +134,8 @@ func TestServiceCrossConnection(t *testing.T) {
 	}
 	defer svcA.Close()
 
-	svcA.Handle("greet", func(msg *arbitro.Msg) {
-		msg.Reply(append([]byte("hello "), msg.Data()...))
-		msg.Ack()
+	svcA.Handle("greet", func(req *arbitro.Request) ([]byte, error) {
+		return append([]byte("hello "), req.Data()...), nil
 	})
 
 	// Requester on client B

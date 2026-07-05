@@ -30,10 +30,8 @@ func main() {
 	defer svc.Close()
 
 	// Register handlers
-	svc.Handle("add", func(msg *arbitro.Msg) {
-		result := fmt.Sprintf("result: %s + ok", msg.Data())
-		msg.Reply([]byte(result))
-		msg.Ack()
+	svc.Handle("add", func(req *arbitro.Request) ([]byte, error) {
+		return []byte(fmt.Sprintf("result: %s + ok", req.Data())), nil
 	})
 
 	// Make a request to ourselves (same service)

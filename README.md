@@ -179,16 +179,18 @@ ctx := context.Background()
 svc, _ := client.Service("calculator").SetMaxInflight(1024).Build(ctx)
 defer svc.Close()
 
-// Register method handlers
-svc.Handle("add", func(msg *arbitro.Msg) {
-    result := compute(msg.Data())
-    msg.Reply([]byte(fmt.Sprintf("sum=%d", result)))
-    msg.Ack()
+// Register method handlers.
+// Return non-nil bytes — the framework replies (if a reply address is
+// present) and acks. Return an error — the framework nacks for redelivery.
+// Return nil bytes with no error — the framework acks without replying.
+// Each handler runs in its own goroutine; slow handlers do not block the
+// dispatcher.
+svc.Handle("add", func(req *arbitro.Request) ([]byte, error) {
+    return []byte(fmt.Sprintf("sum=%d", compute(req.Data()))), nil
 })
 
-svc.Handle("multiply", func(msg *arbitro.Msg) {
-    msg.Reply([]byte(fmt.Sprintf("product=%d", computeMul(msg.Data()))))
-    msg.Ack()
+svc.Handle("multiply", func(req *arbitro.Request) ([]byte, error) {
+    return []byte(fmt.Sprintf("product=%d", computeMul(req.Data()))), nil
 })
 
 // Send a request to another service (or self)

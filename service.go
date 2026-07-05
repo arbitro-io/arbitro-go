@@ -16,8 +16,55 @@ import (
 const svcPrefix = "_svc."
 const replyInfix = "._r."
 
+// Request is a read-only view over an incoming service request.
+//
+// Ack, nack, and reply are managed by the framework based on the handler's
+// return value, so this type intentionally does not expose them.
+type Request struct {
+	subject    []byte
+	payload    []byte
+	hasReply   bool
+	seq        uint64
+	consumerID uint32
+}
+
+// Subject returns the full subject (e.g., "_svc.orders.charge").
+func (r *Request) Subject() []byte { return r.subject }
+
+// Data returns the request payload bytes.
+func (r *Request) Data() []byte { return r.payload }
+
+// HasReply reports whether the requester is waiting for a reply.
+func (r *Request) HasReply() bool { return r.hasReply }
+
+// Seq returns the delivery sequence assigned by the broker.
+func (r *Request) Seq() uint64 { return r.seq }
+
+// ConsumerID returns the consumer that received this request.
+func (r *Request) ConsumerID() uint32 { return r.consumerID }
+
+// Method returns the method segment after the service prefix
+// (e.g., "charge"). Returns nil if the subject is malformed.
+func (r *Request) Method(serviceName string) []byte {
+	prefixLen := len(svcPrefix) + len(serviceName) + 1
+	if len(r.subject) <= prefixLen {
+		return nil
+	}
+	return r.subject[prefixLen:]
+}
+
 // ServiceHandler handles an incoming service request.
-type ServiceHandler func(msg *Msg)
+//
+// Return value semantics (framework handles ack/nack/reply automatically):
+//   - Return non-nil bytes — framework replies to the requester (if a
+//     reply address is present) and acks the delivery.
+//   - Return nil bytes with no error — framework acks without replying.
+//   - Return an error — framework nacks the delivery for redelivery.
+//
+// The framework guarantees exactly one ack or nack per invocation. Each
+// handler runs in its own goroutine, so slow handlers do not block the
+// dispatcher.
+type ServiceHandler func(req *Request) ([]byte, error)
 
 // ServiceConfig holds optional configuration for a Service.
 type ServiceConfig struct {
@@ -139,7 +186,25 @@ func (s *Service) dispatch(msg *Msg) {
 	})
 
 	if handler != nil {
-		handler(msg)
+		hasReply := len(msg.ReplyTo()) > 0
+		req := &Request{
+			subject:    []byte(msg.Subject()),
+			payload:    msg.Data(),
+			hasReply:   hasReply,
+			seq:        msg.Seq(),
+			consumerID: msg.ConsumerID(),
+		}
+		go func() {
+			resp, err := handler(req)
+			if err != nil {
+				msg.Nack()
+				return
+			}
+			if len(resp) > 0 && hasReply {
+				msg.Reply(resp)
+			}
+			msg.Ack()
+		}()
 		return
 	}
 
