@@ -14,7 +14,19 @@ import (
 )
 
 const svcPrefix = "_svc."
+const methodInfix = ".m."
 const replyInfix = "._r."
+
+var nextSvcInstanceID atomic.Uint32
+
+func newSvcInstanceID() uint32 {
+	for {
+		id := nextSvcInstanceID.Add(1)
+		if id != 0 {
+			return id
+		}
+	}
+}
 
 // Request is a read-only view over an incoming service request.
 //
@@ -46,7 +58,8 @@ func (r *Request) ConsumerID() uint32 { return r.consumerID }
 // Method returns the method segment after the service prefix
 // (e.g., "charge"). Returns nil if the subject is malformed.
 func (r *Request) Method(serviceName string) []byte {
-	prefixLen := len(svcPrefix) + len(serviceName) + 1
+	// Subject: _svc.<serviceName>.m.<method>
+	prefixLen := len(svcPrefix) + len(serviceName) + len(methodInfix)
 	if len(r.subject) <= prefixLen {
 		return nil
 	}
@@ -73,9 +86,10 @@ type ServiceConfig struct {
 
 // Service is an RPC service that handles incoming requests and supports outbound request/reply.
 type Service struct {
-	name     string
-	streamID uint32
-	client   *Client
+	name       string
+	streamID   uint32
+	instanceID uint32
+	client     *Client
 
 	handlers sync.Map // map[string]ServiceHandler (subject prefix → handler)
 
@@ -88,7 +102,7 @@ type Service struct {
 
 // Handle registers a handler for the given method on this service.
 func (s *Service) Handle(method string, handler ServiceHandler) {
-	prefix := svcPrefix + s.name + "." + method
+	prefix := svcPrefix + s.name + methodInfix + method
 	s.handlers.Store(prefix, handler)
 }
 
@@ -100,8 +114,8 @@ func (s *Service) Request(ctx context.Context, target, method string, payload []
 	}
 
 	corrID := s.corrID.Add(1)
-	subject := []byte(svcPrefix + target + "." + method)
-	replySubject := svcPrefix + s.name + replyInfix + strconv.FormatUint(corrID, 10)
+	subject := []byte(svcPrefix + target + methodInfix + method)
+	replySubject := svcPrefix + s.name + replyInfix + strconv.FormatUint(uint64(s.instanceID), 10) + "." + strconv.FormatUint(corrID, 10)
 
 	replyTo := make([]byte, 5+len(replySubject))
 	replyTo[0] = ReplyToMagic
@@ -137,7 +151,7 @@ func (s *Service) Send(ctx context.Context, target, method string, payload []byt
 	if err != nil {
 		return err
 	}
-	subject := []byte(svcPrefix + target + "." + method)
+	subject := []byte(svcPrefix + target + methodInfix + method)
 	seq := s.client.conn.NextSeq()
 	frame := proto.EncodePublish(seq, targetStreamID, subject, nil, payload, proto.FlagAckReq)
 	return s.client.conn.Send(frame)
@@ -158,7 +172,8 @@ func (s *Service) dispatch(msg *Msg) {
 	}
 
 	subject := msg.Subject()
-	replyPrefix := svcPrefix + s.name + replyInfix
+	// Reply subject: `_svc.<name>._r.<instanceID>.<corrID>` — instance-scoped.
+	replyPrefix := svcPrefix + s.name + replyInfix + strconv.FormatUint(uint64(s.instanceID), 10) + "."
 
 	if strings.HasPrefix(subject, replyPrefix) {
 		corrStr := subject[len(replyPrefix):]
@@ -250,14 +265,16 @@ func (b *ServiceBuilder) SetMaxInflight(n uint32) *ServiceBuilder {
 	return b
 }
 
-// Build creates the backing stream, consumer, subscription, and returns the ready Service.
+// Build creates the backing stream, two consumers (worker + reply),
+// two subscriptions, and returns the ready Service.
 func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	streamName := "_svc-" + b.name
-	filter := svcPrefix + b.name + ".>"
+	// Stream captures BOTH method and reply subjects.
+	streamFilter := svcPrefix + b.name + ".>"
 
 	// Create stream
 	seq := b.client.conn.NextSeq()
-	frame, err := proto.EncodeCreateStream(seq, []byte(streamName), []byte(filter), 0, 0, 3600, 1, 0, 0, 0, 0)
+	frame, err := proto.EncodeCreateStream(seq, []byte(streamName), []byte(streamFilter), 0, 0, 3600, 1, 0, 0, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("service encode create stream: %w", err)
 	}
@@ -283,70 +300,110 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	}
 	streamID := uint32(proto.RepOkRefSeq(body))
 
-	// Create consumer
-	consumerName := "_svc-" + b.name + "-worker"
+	svc := &Service{
+		name:       b.name,
+		streamID:   streamID,
+		instanceID: newSvcInstanceID(),
+		client:     b.client,
+	}
+	svc.streamCache.Store(b.name, streamID)
+
 	maxInfl := b.maxInflight
 	if maxInfl == 0 {
 		maxInfl = 1024
 	}
 
+	// ── Worker consumer: queue-grouped, receives ONLY method calls. ──
+	workerFilter := svcPrefix + b.name + methodInfix + ">"
+	workerName := "_svc-" + b.name + "-worker"
+
 	seq = b.client.conn.NextSeq()
 	frame, err = proto.EncodeCreateConsumer(
 		seq, streamID,
-		[]byte(consumerName), []byte(consumerName), []byte(filter),
+		[]byte(workerName), []byte(workerName), []byte(workerFilter),
 		uint16(maxInfl), AckExplicit, DeliverAll, 1, // Queue mode
 		30_000, 0, nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("service create consumer: %w", err)
+		return nil, fmt.Errorf("service create worker consumer: %w", err)
 	}
 	reply, err = b.client.conn.SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
-	var consumerID uint32
+	var workerConsumerID uint32
 	if err := b.client.checkReply(reply); err != nil {
 		if !IsAlreadyExists(err) {
 			return nil, err
 		}
-		consumerID, err = b.client.resolveConsumerID(ctx, streamID, consumerName)
+		workerConsumerID, err = b.client.resolveConsumerID(ctx, streamID, workerName)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		body = reply[proto.HeaderSize:]
 		if len(body) < 8 {
-			return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "create consumer: reply too short"}
+			return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "create worker consumer: reply too short"}
 		}
-		consumerID = uint32(proto.RepOkRefSeq(body))
+		workerConsumerID = uint32(proto.RepOkRefSeq(body))
 	}
 
-	svc := &Service{
-		name:     b.name,
-		streamID: streamID,
-		client:   b.client,
-	}
-	svc.streamCache.Store(b.name, streamID)
-
-	// Subscribe with callback dispatch
-	sub := &Subscription{
-		client:     b.client,
-		consumerID: consumerID,
-		ch:         make(chan *Msg, 256),
-		handler:    svc.dispatch,
-		closed:     make(chan struct{}),
-	}
-	b.client.registerSubscription(consumerID, sub)
-	b.client.activeSubs.Add(1)
+	// ── Reply consumer: per-instance, NO group. ──
+	// Replies MUST NOT be load-balanced to sibling instances.
+	replyFilter := svcPrefix + b.name + replyInfix + strconv.FormatUint(uint64(svc.instanceID), 10) + ".>"
+	replyName := "_svc-" + b.name + "-reply-" + strconv.FormatUint(uint64(svc.instanceID), 10)
 
 	seq = b.client.conn.NextSeq()
-	subFrame, err := proto.EncodeSubscribe(seq, consumerID, [][]byte{[]byte(filter)})
+	frame, err = proto.EncodeCreateConsumer(
+		seq, streamID,
+		[]byte(replyName), nil, []byte(replyFilter),
+		uint16(maxInfl), AckExplicit, DeliverNew, 0, // Fanout mode, no group
+		30_000, 0, nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("service create reply consumer: %w", err)
+	}
+	reply, err = b.client.conn.SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
-	_, err = b.client.conn.SendExpectReply(ctx, subFrame, seq)
-	if err != nil {
+	var replyConsumerID uint32
+	if err := b.client.checkReply(reply); err != nil {
 		return nil, err
+	}
+	body = reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "create reply consumer: reply too short"}
+	}
+	replyConsumerID = uint32(proto.RepOkRefSeq(body))
+
+	// Subscribe both consumers to the shared dispatcher.
+	for _, entry := range []struct {
+		cid    uint32
+		filter string
+	}{
+		{workerConsumerID, workerFilter},
+		{replyConsumerID, replyFilter},
+	} {
+		sub := &Subscription{
+			client:     b.client,
+			consumerID: entry.cid,
+			ch:         make(chan *Msg, 256),
+			handler:    svc.dispatch,
+			closed:     make(chan struct{}),
+		}
+		b.client.registerSubscription(entry.cid, sub)
+		b.client.activeSubs.Add(1)
+
+		seq = b.client.conn.NextSeq()
+		subFrame, err := proto.EncodeSubscribe(seq, entry.cid, [][]byte{[]byte(entry.filter)})
+		if err != nil {
+			return nil, err
+		}
+		_, err = b.client.conn.SendExpectReply(ctx, subFrame, seq)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return svc, nil
