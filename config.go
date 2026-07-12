@@ -9,19 +9,19 @@ const (
 	JournalStrict   uint32 = 2
 )
 
+// Wire values pinned to arbitro-proto/src/config/consumer.rs — DO NOT reorder.
+
 // Ack policies for consumer delivery.
 const (
-	AckExplicit uint32 = 0
-	AckNone     uint32 = 1
+	AckNone     uint32 = 0
+	AckExplicit uint32 = 1
 )
 
 // Deliver policies for consumer start position.
 const (
-	DeliverAll    uint32 = 0
-	DeliverNew    uint32 = 1
-	DeliverLast   uint32 = 2
-	DeliverBySeq  uint32 = 3
-	DeliverByTime uint32 = 4
+	DeliverAll        uint32 = 0
+	DeliverNew        uint32 = 1
+	DeliverByStartSeq uint32 = 2
 )
 
 // StreamConfig defines stream creation parameters.
