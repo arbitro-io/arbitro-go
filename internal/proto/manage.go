@@ -1,6 +1,10 @@
 package proto
 
-import "encoding/json"
+import (
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+)
 
 // packCold builds a cold-path (JSON body) frame.
 func packCold(action uint16, seq uint64, payload any) ([]byte, error) {
@@ -110,8 +114,18 @@ func EncodeGetStream(seq uint64, name []byte) ([]byte, error) {
 	return packCold(ActionGetStream, seq, nameOnlyPayload{Name: bytesArr(name)})
 }
 
-func EncodeListStreams(seq uint64) ([]byte, error) {
-	return packCold(ActionListStreams, seq, struct{}{})
+type listStreamsPayload struct {
+	Offset uint32 `json:"offset"`
+	Limit  uint32 `json:"limit"`
+}
+
+// EncodeListStreams sends a paginated ListStreams request.
+// Mirrors arbitro-proto v2::cold::ListStreams { offset, limit }.
+func EncodeListStreams(seq uint64, offset, limit uint32) ([]byte, error) {
+	return packCold(ActionListStreams, seq, listStreamsPayload{
+		Offset: offset,
+		Limit:  limit,
+	})
 }
 
 func EncodePurgeStream(seq uint64, name []byte) ([]byte, error) {
@@ -180,14 +194,15 @@ func EncodeCreateConsumer(seq uint64, streamID uint32, name, group, subject []by
 }
 
 type deleteConsumerPayload struct {
-	StreamID uint32 `json:"stream_id"`
-	Name     []int  `json:"name"`
+	ConsumerID uint32 `json:"consumer_id"`
 }
 
-func EncodeDeleteConsumer(seq uint64, streamID uint32, name []byte) ([]byte, error) {
+// EncodeDeleteConsumer builds a DeleteConsumer cold frame. The wire body is a
+// single `consumer_id` (see arbitro-proto v2::cold DeleteConsumer). The caller
+// must resolve the consumer's numeric ID from (stream, name) before calling.
+func EncodeDeleteConsumer(seq uint64, consumerID uint32) ([]byte, error) {
 	return packCold(ActionDeleteConsumer, seq, deleteConsumerPayload{
-		StreamID: streamID,
-		Name:     bytesArr(name),
+		ConsumerID: consumerID,
 	})
 }
 
@@ -203,8 +218,21 @@ func EncodeGetConsumer(seq uint64, streamID uint32, name []byte) ([]byte, error)
 	})
 }
 
-func EncodeListConsumers(seq uint64) ([]byte, error) {
-	return packCold(ActionListConsumers, seq, struct{}{})
+type listConsumersPayload struct {
+	StreamID uint32 `json:"stream_id"`
+	Offset   uint32 `json:"offset"`
+	Limit    uint32 `json:"limit"`
+}
+
+// EncodeListConsumers sends a paginated ListConsumers request. Passing
+// streamID=0 lists consumers across every stream (broker semantic).
+// Mirrors arbitro-proto v2::cold::ListConsumers { stream_id, offset, limit }.
+func EncodeListConsumers(seq uint64, streamID, offset, limit uint32) ([]byte, error) {
+	return packCold(ActionListConsumers, seq, listConsumersPayload{
+		StreamID: streamID,
+		Offset:   offset,
+		Limit:    limit,
+	})
 }
 
 func EncodePauseConsumer(seq uint64, streamID uint32, name []byte) ([]byte, error) {
@@ -245,4 +273,78 @@ func EncodeDeleteCron(seq uint64, name []byte) ([]byte, error) {
 
 func EncodeListCrons(seq uint64) ([]byte, error) {
 	return packCold(ActionListCrons, seq, struct{}{})
+}
+
+// --- List replies (binary body — not JSON, per dispatch_v2.rs) ---
+
+// StreamListEntry is one entry in a ListStreams reply.
+type StreamListEntry struct {
+	StreamID uint32
+	Name     []byte
+}
+
+// ConsumerListEntry is one entry in a ListConsumers reply.
+type ConsumerListEntry struct {
+	ConsumerID uint32
+	StreamID   uint32
+	QueueID    uint32
+	Paused     bool
+}
+
+// DecodeListStreamsBody parses the ListStreams reply body:
+//   count u32 LE, then N × (wire_id u32 LE, name_len u16 LE, name bytes)
+// This mirrors dispatch_v2::v2_list_streams on the server side.
+func DecodeListStreamsBody(body []byte) ([]StreamListEntry, error) {
+	if len(body) < 4 {
+		return nil, errors.New("list streams: body too short")
+	}
+	count := binary.LittleEndian.Uint32(body[0:4])
+	off := 4
+	out := make([]StreamListEntry, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if off+6 > len(body) {
+			return nil, errors.New("list streams: truncated entry header")
+		}
+		id := binary.LittleEndian.Uint32(body[off : off+4])
+		nameLen := int(binary.LittleEndian.Uint16(body[off+4 : off+6]))
+		off += 6
+		if off+nameLen > len(body) {
+			return nil, errors.New("list streams: truncated name")
+		}
+		name := make([]byte, nameLen)
+		copy(name, body[off:off+nameLen])
+		off += nameLen
+		out = append(out, StreamListEntry{StreamID: id, Name: name})
+	}
+	return out, nil
+}
+
+// DecodeListConsumersBody parses the ListConsumers reply body:
+//   count u32 LE, then N × (consumer_id u32, stream_id u32, queue_id u32, paused u8) = 13B
+// This mirrors dispatch_v2::v2_list_consumers on the server side.
+func DecodeListConsumersBody(body []byte) ([]ConsumerListEntry, error) {
+	if len(body) < 4 {
+		return nil, errors.New("list consumers: body too short")
+	}
+	count := binary.LittleEndian.Uint32(body[0:4])
+	const entrySize = 13
+	if len(body) < 4+int(count)*entrySize {
+		return nil, errors.New("list consumers: body truncated")
+	}
+	out := make([]ConsumerListEntry, 0, count)
+	off := 4
+	for i := uint32(0); i < count; i++ {
+		cid := binary.LittleEndian.Uint32(body[off : off+4])
+		sid := binary.LittleEndian.Uint32(body[off+4 : off+8])
+		qid := binary.LittleEndian.Uint32(body[off+8 : off+12])
+		paused := body[off+12] != 0
+		off += entrySize
+		out = append(out, ConsumerListEntry{
+			ConsumerID: cid,
+			StreamID:   sid,
+			QueueID:    qid,
+			Paused:     paused,
+		})
+	}
+	return out, nil
 }

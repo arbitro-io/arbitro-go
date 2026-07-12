@@ -222,6 +222,12 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 		// Resolve pending request by seq
 		c.pending.Resolve(hdr.Seq, frame)
 
+	case proto.ActionListStreams, proto.ActionListConsumers:
+		// List replies reuse the request's action code as their header action
+		// (see arbitro-server dispatch_v2::v2_list_streams / v2_list_consumers).
+		// Route them through the pending map by seq like any other reply.
+		c.pending.Resolve(hdr.Seq, frame)
+
 	case proto.ActionDeliver:
 		if c.onDeliver != nil {
 			c.onDeliver(frame)

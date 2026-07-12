@@ -93,21 +93,44 @@ func (c *Client) StreamInfo(ctx context.Context, name string) (*StreamInfo, erro
 }
 
 // ListStreams returns all streams on the broker.
+// The reply is paginated server-side (default limit ~1000); the client walks
+// pages until the broker returns an empty batch.
 func (c *Client) ListStreams(ctx context.Context) ([]StreamInfo, error) {
-	seq := c.conn.NextSeq()
-	frame, err := proto.EncodeListStreams(seq)
-	if err != nil {
-		return nil, err
+	const pageLimit uint32 = 1000
+	var out []StreamInfo
+	for offset := uint32(0); ; {
+		seq := c.conn.NextSeq()
+		frame, err := proto.EncodeListStreams(seq, offset, pageLimit)
+		if err != nil {
+			return nil, err
+		}
+		reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.checkReply(reply); err != nil {
+			return nil, err
+		}
+		entries, err := proto.DecodeListStreamsBody(reply[proto.HeaderSize:])
+		if err != nil {
+			return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "list streams: " + err.Error()}
+		}
+		if len(entries) == 0 {
+			break
+		}
+		for i := range entries {
+			out = append(out, StreamInfo{
+				Name:     string(entries[i].Name),
+				StreamID: entries[i].StreamID,
+			})
+			c.streams.set(string(entries[i].Name), entries[i].StreamID)
+		}
+		if uint32(len(entries)) < pageLimit {
+			break
+		}
+		offset += uint32(len(entries))
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.checkReply(reply); err != nil {
-		return nil, err
-	}
-	// TODO: parse JSON response body
-	return nil, nil
+	return out, nil
 }
 
 // StreamExists checks if a stream exists.
@@ -188,13 +211,19 @@ func (c *Client) CreateConsumer(ctx context.Context, stream string, cfg Consumer
 }
 
 // DeleteConsumer removes a consumer by stream name and consumer name.
+// The wire body carries only `consumer_id`, so (stream, name) is resolved to a
+// numeric ID before the delete is sent.
 func (c *Client) DeleteConsumer(ctx context.Context, stream, name string) error {
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
 		return err
 	}
+	consumerID, err := c.resolveConsumerID(ctx, streamID, name)
+	if err != nil {
+		return err
+	}
 	seq := c.conn.NextSeq()
-	frame, err := proto.EncodeDeleteConsumer(seq, streamID, []byte(name))
+	frame, err := proto.EncodeDeleteConsumer(seq, consumerID)
 	if err != nil {
 		return err
 	}
@@ -252,22 +281,52 @@ func (c *Client) ConsumerInfo(ctx context.Context, stream, name string) (*Consum
 	return &ConsumerInfo{Name: name, StreamID: streamID}, nil
 }
 
-// ListConsumers returns all consumers for a stream.
+// ListConsumers returns all consumers for a stream. Pass stream="" to list
+// consumers across every stream (broker semantic: stream_id=0).
 func (c *Client) ListConsumers(ctx context.Context, stream string) ([]ConsumerInfo, error) {
-	seq := c.conn.NextSeq()
-	frame, err := proto.EncodeListConsumers(seq)
-	if err != nil {
-		return nil, err
+	var streamID uint32
+	if stream != "" {
+		id, err := c.resolveStreamID(ctx, stream)
+		if err != nil {
+			return nil, err
+		}
+		streamID = id
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
-	if err != nil {
-		return nil, err
+
+	const pageLimit uint32 = 1000
+	var out []ConsumerInfo
+	for offset := uint32(0); ; {
+		seq := c.conn.NextSeq()
+		frame, err := proto.EncodeListConsumers(seq, streamID, offset, pageLimit)
+		if err != nil {
+			return nil, err
+		}
+		reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.checkReply(reply); err != nil {
+			return nil, err
+		}
+		entries, err := proto.DecodeListConsumersBody(reply[proto.HeaderSize:])
+		if err != nil {
+			return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "list consumers: " + err.Error()}
+		}
+		if len(entries) == 0 {
+			break
+		}
+		for i := range entries {
+			out = append(out, ConsumerInfo{
+				ConsumerID: entries[i].ConsumerID,
+				StreamID:   entries[i].StreamID,
+			})
+		}
+		if uint32(len(entries)) < pageLimit {
+			break
+		}
+		offset += uint32(len(entries))
 	}
-	if err := c.checkReply(reply); err != nil {
-		return nil, err
-	}
-	// TODO: parse JSON response body
-	return nil, nil
+	return out, nil
 }
 
 // PauseConsumer pauses delivery to a consumer.

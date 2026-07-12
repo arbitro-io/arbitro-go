@@ -155,44 +155,69 @@ func (c *Client) PublishFireAndForget(streamID uint32, subject string, payload [
 	return err
 }
 
-// PublishBatchAsync sends a batch of messages without waiting for confirmation.
-// Equivalent to Rust's publish_batch() — fire-and-forget, write-coalesced.
-func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
-	streamID, _ := c.streams.get(stream)
+// publishBatchMax mirrors Rust's PUBLISH_BATCH_MAX (arbitro-client-tokio) —
+// the largest number of entries the broker accepts in a single PubBatch frame.
+const publishBatchMax = 256
 
-	protoEntries := make([]proto.BatchEntry, len(entries))
+// encodeBatchEntries maps public BatchEntry to the proto wire form with the
+// client's subject prefix applied.
+func (c *Client) encodeBatchEntries(entries []BatchEntry) []proto.BatchEntry {
+	out := make([]proto.BatchEntry, len(entries))
 	for i := range entries {
-		protoEntries[i] = proto.BatchEntry{
+		out[i] = proto.BatchEntry{
 			Subject: []byte(c.prefixed(entries[i].Subject)),
 			MsgID:   []byte(entries[i].MsgID),
 			Payload: entries[i].Payload,
 		}
 	}
+	return out
+}
 
-	seq := c.conn.NextSeq()
-	frame := proto.EncodePublishBatch(seq, streamID, protoEntries, proto.FlagNone)
-	_ = c.conn.Send(frame)
+// PublishBatchAsync sends a batch of messages without waiting for confirmation.
+// Equivalent to Rust's publish_batch() — fire-and-forget, write-coalesced.
+// Batches larger than publishBatchMax entries are split into multiple frames,
+// matching the Rust client's automatic chunking.
+func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	streamID, _ := c.streams.get(stream)
+	protoEntries := c.encodeBatchEntries(entries)
+
+	for start := 0; start < len(protoEntries); start += publishBatchMax {
+		end := start + publishBatchMax
+		if end > len(protoEntries) {
+			end = len(protoEntries)
+		}
+		seq := c.conn.NextSeq()
+		frame := proto.EncodePublishBatch(seq, streamID, protoEntries[start:end], proto.FlagNone)
+		_ = c.conn.Send(frame)
+	}
 	c.publishesSent.Add(1)
 }
 
-// PublishBatch atomically publishes multiple messages. Returns the first seq assigned.
+// PublishBatch atomically publishes multiple messages. Returns the first seq
+// assigned by the broker. Batches larger than publishBatchMax are chunked: the
+// first chunk is sent with AckReq (so the caller can await first_seq); the
+// remaining chunks are fire-and-forget, matching the Rust client.
 func (c *Client) PublishBatch(ctx context.Context, stream string, entries []BatchEntry) (uint64, error) {
+	if len(entries) == 0 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "publish batch: empty entries"}
+	}
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
 		return 0, err
 	}
 
-	protoEntries := make([]proto.BatchEntry, len(entries))
-	for i := range entries {
-		protoEntries[i] = proto.BatchEntry{
-			Subject: []byte(c.prefixed(entries[i].Subject)),
-			MsgID:   []byte(entries[i].MsgID),
-			Payload: entries[i].Payload,
-		}
-	}
+	protoEntries := c.encodeBatchEntries(entries)
 
+	// First chunk — synchronous, carries FlagAckReq so we can read first_seq.
+	firstEnd := publishBatchMax
+	if firstEnd > len(protoEntries) {
+		firstEnd = len(protoEntries)
+	}
 	seq := c.conn.NextSeq()
-	frame := proto.EncodePublishBatch(seq, streamID, protoEntries, proto.FlagAckReq)
+	frame := proto.EncodePublishBatch(seq, streamID, protoEntries[:firstEnd], proto.FlagAckReq)
 
 	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
 	if err != nil {
@@ -207,6 +232,20 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "publish batch: reply body too short"}
 	}
 	firstSeq := proto.RepOkRefSeq(body)
+
+	// Remaining chunks — fire-and-forget, mirroring Rust's publish_batch_sync.
+	for start := firstEnd; start < len(protoEntries); start += publishBatchMax {
+		end := start + publishBatchMax
+		if end > len(protoEntries) {
+			end = len(protoEntries)
+		}
+		s := c.conn.NextSeq()
+		f := proto.EncodePublishBatch(s, streamID, protoEntries[start:end], proto.FlagNone)
+		if err := c.conn.Send(f); err != nil {
+			return firstSeq, err
+		}
+	}
+
 	return firstSeq, nil
 }
 

@@ -36,7 +36,8 @@ func TestHeaderRoundTrip(t *testing.T) {
 
 func TestHelloEncoding(t *testing.T) {
 	buf := make([]byte, HelloSize)
-	EncodeHello(buf, CapReply)
+	// M9: pass a non-zero arg — the reserved pad is always written as 0.
+	EncodeHello(buf, 0xFFFF)
 
 	// Check magic "ARB2" (LE: 0x41, 0x52, 0x42, 0x32)
 	if buf[0] != 0x41 || buf[1] != 0x52 || buf[2] != 0x42 || buf[3] != 0x32 {
@@ -48,9 +49,9 @@ func TestHelloEncoding(t *testing.T) {
 	if buf[5] != RoleClient {
 		t.Errorf("role: got %d, want %d", buf[5], RoleClient)
 	}
-	// caps = 0x0002 (CapReply) in LE
-	if buf[6] != 0x02 || buf[7] != 0x00 {
-		t.Errorf("caps: got %x %x, want 02 00", buf[6], buf[7])
+	// M9: reserved pad — must be 0 on the wire regardless of arg.
+	if buf[6] != 0x00 || buf[7] != 0x00 {
+		t.Errorf("reserved pad: got %x %x, want 00 00", buf[6], buf[7])
 	}
 }
 

@@ -107,11 +107,14 @@ func EncodePublishDelayed(seq uint64, streamID uint32, subject, payload []byte, 
 }
 
 // EncodePublishWithReply builds a PublishWithReply frame.
-// Body layout: stream_id(4) + subject_len(2) + reply_len(2) + _pad(4) + subject + reply_to + payload
+// Body layout (see arbitro-proto v2::ingress::pub_with_reply):
+//   stream_id(4) + subject_len(2) + reply_len(2) + msg_id_len(2) + _pad(2) +
+//   subject + reply_to + msg_id + payload
 func EncodePublishWithReply(seq uint64, streamID uint32, subject, replyTo, msgID, payload []byte, flags byte) []byte {
 	subjLen := len(subject)
 	replyLen := len(replyTo)
-	bodyLen := 12 + subjLen + replyLen + len(payload)
+	msgIDLen := len(msgID)
+	bodyLen := 12 + subjLen + replyLen + msgIDLen + len(payload)
 
 	frame := make([]byte, HeaderSize+bodyLen)
 	EncodeHeader(frame, Header{
@@ -126,10 +129,16 @@ func EncodePublishWithReply(seq uint64, streamID uint32, subject, replyTo, msgID
 	binary.LittleEndian.PutUint32(body[0:4], streamID)
 	binary.LittleEndian.PutUint16(body[4:6], uint16(subjLen))
 	binary.LittleEndian.PutUint16(body[6:8], uint16(replyLen))
-	binary.LittleEndian.PutUint32(body[8:12], 0) // reserved pad
-	copy(body[12:], subject)
-	copy(body[12+subjLen:], replyTo)
-	copy(body[12+subjLen+replyLen:], payload)
+	binary.LittleEndian.PutUint16(body[8:10], uint16(msgIDLen))
+	binary.LittleEndian.PutUint16(body[10:12], 0) // reserved pad
+	off := 12
+	copy(body[off:], subject)
+	off += subjLen
+	copy(body[off:], replyTo)
+	off += replyLen
+	copy(body[off:], msgID)
+	off += msgIDLen
+	copy(body[off:], payload)
 
 	return frame
 }

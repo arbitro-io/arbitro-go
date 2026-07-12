@@ -14,15 +14,21 @@ const (
 )
 
 // EncodeHello writes the 8-byte handshake into dst.
-// Format: magic(4) + version(1) + role(1) + caps(2 LE)
-func EncodeHello(dst []byte, caps uint16) {
+// Format (see arbitro-proto v2::ingress::hello::HelloFrame):
+//   magic(4) + version(1) + role(1) + _pad(2 LE, reserved — must be 0)
+// M9 removed the caps field; the trailing u16 is a reserved pad the client
+// MUST write as 0 and the server ignores. Any future negotiation lives in a
+// dedicated HelloAck frame.
+func EncodeHello(dst []byte, _pad uint16) {
 	binary.LittleEndian.PutUint32(dst[0:4], HelloMagic)
 	dst[4] = 2 // version
 	dst[5] = RoleClient
-	binary.LittleEndian.PutUint16(dst[6:8], caps)
+	binary.LittleEndian.PutUint16(dst[6:8], 0)
 }
 
-// DefaultCaps returns the standard client capabilities (Reply support).
+// DefaultCaps returns the value written into the Hello frame's reserved
+// trailing u16. M9 removed capability bits from Hello — the field is now a
+// pad that must be 0.
 func DefaultCaps() uint16 {
-	return CapReply
+	return 0
 }
