@@ -251,19 +251,32 @@ func EncodeResumeConsumer(seq uint64, streamID uint32, name []byte) ([]byte, err
 
 // --- Cron ---
 
+// createCronPayload mirrors arbitro-proto wire::cron::CreateCronBody:
+// {"name": String, "every": String, "tz": Option<String>, "timeout_ms": u32, "overlap": bool}.
+// name/every are JSON strings (standard json.Marshal UTF-8 encoding) — NOT
+// byte arrays, which would serialize to base64 and break wire compatibility.
 type createCronPayload struct {
-	Name     []int  `json:"name"`
-	CronExpr string `json:"cron_expr"`
-	Tz       string `json:"tz"`
-	Overlap  bool   `json:"overlap"`
+	Name      string  `json:"name"`
+	Every     string  `json:"every"`
+	Tz        *string `json:"tz,omitempty"`
+	TimeoutMs uint32  `json:"timeout_ms"`
+	Overlap   bool    `json:"overlap"`
 }
 
-func EncodeCreateCron(seq uint64, name []byte, cronExpr, tz string, overlap bool) ([]byte, error) {
+// EncodeCreateCron builds a CreateCron cold frame. every is the cron
+// expression, timeoutMs is the handler timeout (0 = no timeout, per
+// arbitro-proto CreateCronBody.timeout_ms semantics).
+func EncodeCreateCron(seq uint64, name []byte, every, tz string, timeoutMs uint32, overlap bool) ([]byte, error) {
+	var tzPtr *string
+	if tz != "" {
+		tzPtr = &tz
+	}
 	return packCold(ActionCreateCron, seq, createCronPayload{
-		Name:     bytesArr(name),
-		CronExpr: cronExpr,
-		Tz:       tz,
-		Overlap:  overlap,
+		Name:      string(name),
+		Every:     every,
+		Tz:        tzPtr,
+		TimeoutMs: timeoutMs,
+		Overlap:   overlap,
 	})
 }
 

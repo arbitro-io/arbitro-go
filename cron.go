@@ -2,7 +2,6 @@ package arbitro
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/arbitro-io/arbitro-go/internal/proto"
@@ -74,8 +73,14 @@ func (b *CronBuilder) Overlap(allow bool) *CronBuilder {
 // Run registers the cron on the broker and starts dispatching fires to the handler.
 func (b *CronBuilder) Run(ctx context.Context, handler CronHandler) (*CronHandle, error) {
 	// Register cron on broker
+	timeout := b.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	timeoutMs := uint32(timeout.Milliseconds())
+
 	seq := b.client.conn.NextSeq()
-	frame, err := proto.EncodeCreateCron(seq, []byte(b.name), b.expr, b.tz, b.overlap)
+	frame, err := proto.EncodeCreateCron(seq, []byte(b.name), b.expr, b.tz, timeoutMs, b.overlap)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +109,7 @@ func (b *CronBuilder) Run(ctx context.Context, handler CronHandler) (*CronHandle
 	}
 	b.client.crons[b.name] = &cronEntry{
 		handler: handler,
-		timeout: b.timeout,
+		timeout: timeout,
 		handle:  handle,
 	}
 	b.client.cronMu.Unlock()
@@ -152,49 +157,69 @@ type cronEntry struct {
 // cronRegistry holds registered cron handlers. Added to Client struct via extension.
 // The cronMu and crons fields are added to the Client in client_cron.go.
 
-// dispatchCronFire is called by the connection dispatch when a CronFire frame arrives.
+// dispatchCronFire is called by the connection dispatch when a CronFire frame
+// arrives (registered via conn.SetCronFireHandler in Connect). CronFire uses
+// a fixed BINARY body layout (see arbitro-proto wire/cron.rs), not JSON.
 func (c *Client) dispatchCronFire(frame []byte) {
+	if len(frame) < proto.HeaderSize {
+		return
+	}
 	body := frame[proto.HeaderSize:]
 
-	// Parse JSON body: {"name":"...","fire_time":..., "fire_count":...}
-	var fire struct {
-		Name      string `json:"name"`
-		FireTime  int64  `json:"fire_time"`
-		FireCount uint64 `json:"fire_count"`
-	}
-	if err := json.Unmarshal(body, &fire); err != nil {
+	name, fireTimeMs, fireCount, err := proto.DecodeCronFireBody(body)
+	if err != nil {
 		return
 	}
 
 	c.cronMu.Lock()
-	entry, ok := c.crons[fire.Name]
+	entry, ok := c.crons[name]
 	c.cronMu.Unlock()
 
 	if !ok {
 		return
 	}
 
-	// Invoke handler in a goroutine with timeout
+	go c.runCronHandler(entry, name, fireTimeMs, fireCount)
+}
+
+// runCronHandler invokes the user's cron handler with the configured
+// timeout enforced. The handler runs in its own goroutine so a select can
+// race it against ctx.Done(); if the timeout fires first, an error CronAck
+// is sent immediately (releasing the fire for another worker) and the
+// eventual handler result — even if it later succeeds — is discarded and
+// never produces a second, contradicting ack.
+func (c *Client) runCronHandler(entry *cronEntry, name string, fireTimeMs, fireCount uint64) {
+	timeout := entry.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	fire := CronFire{
+		Name:  name,
+		Time:  time.UnixMilli(int64(fireTimeMs)),
+		Index: fireCount,
+	}
+
+	resultCh := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), entry.timeout)
-		defer cancel()
-
-		cronFire := CronFire{
-			Name:  fire.Name,
-			Time:  time.UnixMilli(fire.FireTime),
-			Index: fire.FireCount,
-		}
-
-		err := entry.handler(cronFire)
-		_ = ctx // used for timeout enforcement on the handler
-
-		// Send CronAck back to broker
-		ackSeq := c.conn.NextSeq()
-		ackOK := err == nil
-		ackFrame, ackErr := proto.EncodeCronAck(ackSeq, []byte(fire.Name), ackOK)
-		if ackErr == nil {
-			_ = c.conn.Send(ackFrame)
-		}
+		resultCh <- entry.handler(fire)
 	}()
+
+	var ackOK bool
+	select {
+	case err := <-resultCh:
+		ackOK = err == nil
+	case <-ctx.Done():
+		// Handler timed out — nack so the broker can reassign the fire.
+		ackOK = false
+	}
+
+	ackSeq := c.conn.NextSeq()
+	ackFrame, ackErr := proto.EncodeCronAck(ackSeq, []byte(name), ackOK)
+	if ackErr == nil {
+		_ = c.conn.Send(ackFrame)
+	}
 }
 

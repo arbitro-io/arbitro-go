@@ -80,6 +80,9 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 	// Wire up deliver dispatch
 	c.SetDeliverHandler(client.handleDeliver)
 
+	// Wire up cron fire dispatch
+	c.SetCronFireHandler(client.dispatchCronFire)
+
 	return client, nil
 }
 

@@ -30,6 +30,9 @@ type Connection struct {
 	// Subscription dispatch: consumer_id → handler
 	onDeliver func(frame []byte) // raw frame dispatch (for subscription layer)
 
+	// Cron fire dispatch: raw frame dispatch (for cron layer)
+	onCronFire func(frame []byte)
+
 	// Diagnostics
 	BatchRecv atomic.Uint64
 
@@ -126,6 +129,14 @@ func (c *Connection) SendExpectReply(ctx context.Context, frame []byte, seq uint
 // SetDeliverHandler sets the raw deliver dispatch function.
 func (c *Connection) SetDeliverHandler(fn func(frame []byte)) {
 	c.onDeliver = fn
+}
+
+// SetCronFireHandler sets the raw CronFire dispatch function. Unlike
+// ordinary replies, CronFire frames carry a broker-chosen seq that is not
+// registered in the PendingMap, so they must be routed through this
+// dedicated callback rather than pending.Resolve.
+func (c *Connection) SetCronFireHandler(fn func(frame []byte)) {
+	c.onCronFire = fn
 }
 
 // Close shuts down the connection gracefully.
@@ -243,8 +254,11 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 		// Heartbeat response — no action needed
 
 	case proto.ActionCronFire:
-		// Cron fire: resolve via pending (uses seq correlation)
-		c.pending.Resolve(hdr.Seq, frame)
+		// Cron fire: broker-initiated push, not correlated to any pending
+		// request seq. Route to the dedicated cron dispatcher.
+		if c.onCronFire != nil {
+			c.onCronFire(frame)
+		}
 
 	}
 }
