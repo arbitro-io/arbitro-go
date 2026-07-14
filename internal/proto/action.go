@@ -43,13 +43,13 @@ const (
 	ActionDeleteMessage uint16 = 0x0407
 
 	// Consumer management (cold path, JSON body)
-	ActionCreateConsumer  uint16 = 0x0501
-	ActionDeleteConsumer  uint16 = 0x0502
-	ActionGetConsumer     uint16 = 0x0503
-	ActionListConsumers   uint16 = 0x0504
-	ActionConsumerStats   uint16 = 0x0505
-	ActionPauseConsumer   uint16 = 0x0506
-	ActionResumeConsumer  uint16 = 0x0507
+	ActionCreateConsumer uint16 = 0x0501
+	ActionDeleteConsumer uint16 = 0x0502
+	ActionGetConsumer    uint16 = 0x0503
+	ActionListConsumers  uint16 = 0x0504
+	ActionConsumerStats  uint16 = 0x0505
+	ActionPauseConsumer  uint16 = 0x0506
+	ActionResumeConsumer uint16 = 0x0507
 
 	// System
 	ActionPing       uint16 = 0x0601
@@ -67,6 +67,12 @@ const (
 
 	// Delayed publish (hot path)
 	ActionPublishDelayed uint16 = 0x0801
+
+	// Ack-reliability hot tier (G01) — deferred-ack replay/confirm protocol.
+	ActionAckStateReq  uint16 = 0x0A01
+	ActionAckStateRep  uint16 = 0x0A02
+	ActionAckBatch     uint16 = 0x0A03
+	ActionAckBatchResp uint16 = 0x0A04
 )
 
 // Frame header flags (offset +2)

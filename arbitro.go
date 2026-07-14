@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arbitro-io/arbitro-go/internal/ackrel"
 	"github.com/arbitro-io/arbitro-go/internal/conn"
 	"github.com/arbitro-io/arbitro-go/internal/proto"
 )
@@ -59,6 +60,13 @@ type Client struct {
 	reqCorrID  atomic.Uint64
 	reqPending sync.Map // map[uint64]chan []byte
 
+	// Ack-reliability hot tier (G01) — outlives any single Connection,
+	// re-attached to the new Connection after every reconnect. seenCache
+	// (G18) dedupes redeliveries so the user handler runs at most once per
+	// (consumer, seq).
+	ackRelay  *ackrel.Relay
+	seenCache *ackrel.SeenCache
+
 	// metrics
 	publishesSent  atomic.Uint64
 	deliveriesRecv atomic.Uint64
@@ -66,6 +74,10 @@ type Client struct {
 	nacksSent      atomic.Uint64
 	reconnects     atomic.Uint64
 	activeSubs     atomic.Uint64
+	publishErrors  atomic.Uint64
+	acksDeferred   atomic.Uint64
+	acksConfirmed  atomic.Uint64
+	acksExpired    atomic.Uint64
 
 	// Reconnect / lifecycle state.
 	closing atomic.Bool // Close() was called by the user — supervisor exits quietly.
@@ -113,7 +125,10 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		},
 		subFilters: make(map[uint32][][]byte),
 	}
+	client.seenCache = ackrel.NewSeenCache()
+	client.ackRelay = ackrel.NewRelay(100*time.Millisecond, client.sendAckBatch)
 	client.connPtr.Store(c)
+	c.AckRelay = client.ackRelay
 
 	// Wire up deliver dispatch
 	c.SetDeliverHandler(client.handleDeliver)
@@ -160,7 +175,30 @@ func (c *Client) getConn() *conn.Connection {
 // supervisor from restarting it.
 func (c *Client) Close() error {
 	c.closing.Store(true)
+	if c.ackRelay != nil {
+		c.ackRelay.Close()
+	}
 	return c.getConn().Close()
+}
+
+// sendAckBatch transmits an AckBatch frame for the given consumer/generation/
+// seqs over the currently live connection. Passed to ackrel.NewRelay as the
+// sweep goroutine's flush callback (fired every 100ms for consumers with
+// outstanding deferred acks — G01).
+func (c *Client) sendAckBatch(consumerID, generation uint32, seqs []uint64) {
+	conn := c.connPtr.Load()
+	if conn == nil {
+		return
+	}
+	for start := 0; start < len(seqs); start += proto.AckBatchMaxSeqs {
+		end := start + proto.AckBatchMaxSeqs
+		if end > len(seqs) {
+			end = len(seqs)
+		}
+		seq := conn.NextSeq()
+		frame := proto.EncodeAckBatch(seq, consumerID, generation, 0, seqs[start:end])
+		_ = conn.Send(frame)
+	}
 }
 
 // Metrics returns a point-in-time snapshot of client counters.
@@ -508,6 +546,13 @@ func (c *Client) dispatchSingleDeliver(frame []byte, hdr proto.Header) {
 		client:      c,
 	}
 
+	if c.seenCache != nil && !c.seenCache.InsertIfNew(dh.ConsumerID, hdr.Seq) {
+		// Redelivery of a message already run through the user handler once
+		// (G18) — re-ack without invoking it again.
+		c.getConn().AckBatch.Ack(dh.ConsumerID, dh.SubjectHash, hdr.Seq)
+		return
+	}
+
 	c.deliverToSub(sub, msg)
 }
 
@@ -565,6 +610,13 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 			client:      c,
 		}
 
+		if c.seenCache != nil && !c.seenCache.InsertIfNew(consumerID, seq) {
+			// Redelivery dedup (G18) — re-ack without re-invoking the handler.
+			c.getConn().AckBatch.Ack(consumerID, subjectHash, seq)
+			off = entryPayloadStart + totalTail
+			continue
+		}
+
 		c.deliverToSub(sub, msg)
 		off = entryPayloadStart + totalTail
 	}
@@ -596,7 +648,6 @@ func (c *Client) deliverToSub(sub *Subscription, msg *Msg) {
 		}
 	}
 }
-
 
 // --- reconnect supervisor (G02) ---
 //
@@ -659,14 +710,36 @@ func (c *Client) doReconnect() (*conn.Connection, error) {
 
 	newConn.SetDeliverHandler(c.handleDeliver)
 	newConn.SetCronFireHandler(c.dispatchCronFire)
+	newConn.AckRelay = c.ackRelay
 
 	c.connPtr.Store(newConn)
 	c.reconnects.Add(1)
 
 	c.replaySubscriptions(newConn)
 	c.replayCrons(newConn)
+	c.replayAckState(newConn)
 
 	return newConn, nil
+}
+
+// replayAckState sends an AckStateReq for every consumer with outstanding
+// deferred acks, over the freshly (re)dialed connection — carrying each
+// consumer's last-known generation unchanged. The broker replies with its
+// authoritative cursor/retention snapshot (handleAckStateRep): if the
+// generation still matches, the deferred set is confirmed valid and
+// replayed as AckBatch frames; on mismatch it's reconciled (wiped) instead.
+// Mirrors the Rust supervisor's conn::session::send_ack_state_reqs, which
+// forwards `s.generation` from `active_consumers()` unmodified (G01).
+func (c *Client) replayAckState(newConn *conn.Connection) {
+	if c.ackRelay == nil {
+		return
+	}
+	for _, cid := range c.ackRelay.ActiveConsumers() {
+		gen := c.ackRelay.Generation(cid)
+		seq := newConn.NextSeq()
+		frame := proto.EncodeAckStateReq(seq, cid, gen)
+		_ = newConn.Send(frame)
+	}
 }
 
 // replaySubscriptions re-sends a Subscribe frame for every consumer_id that

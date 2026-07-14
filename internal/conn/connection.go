@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arbitro-io/arbitro-go/internal/ackrel"
 	"github.com/arbitro-io/arbitro-go/internal/proto"
 )
 
@@ -27,6 +28,12 @@ type Connection struct {
 	// Ack batcher — batches individual acks into BatchAck frames.
 	AckBatch *AckBatcher
 
+	// AckRelay is the client's ack-reliability hot tier (G01). It outlives
+	// any single Connection (the owning Client re-attaches it after every
+	// reconnect), so this field is set by the caller after Dial returns —
+	// never allocated here. Nil-safe: dispatch/ackbatcher no-op if unset.
+	AckRelay *ackrel.Relay
+
 	// Subscription dispatch: consumer_id → handler
 	onDeliver func(frame []byte) // raw frame dispatch (for subscription layer)
 
@@ -36,8 +43,8 @@ type Connection struct {
 	// Diagnostics
 	BatchRecv atomic.Uint64
 
-	closed atomic.Bool
-	done   chan struct{}
+	closed  atomic.Bool
+	done    chan struct{}
 	timeout time.Duration
 
 	// Heartbeat / dead-connection watchdog (G09). lastPongMs is stamped on
@@ -315,7 +322,63 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 			c.onCronFire(frame)
 		}
 
+	case proto.ActionAckStateRep:
+		c.handleAckStateRep(body)
+
+	case proto.ActionAckBatchResp:
+		c.handleAckBatchResp(body)
+
 	}
+}
+
+// handleAckStateRep reconciles the ack-reliability hot tier against the
+// broker's authoritative cursor/retention snapshot for one consumer (reply
+// to an AckStateReq sent on reconnect). Mirrors dispatch_ack_state_rep in
+// the Rust client's transport/reader.rs.
+func (c *Connection) handleAckStateRep(body []byte) {
+	if c.AckRelay == nil {
+		return
+	}
+	consumerID, generation, cursor, lowSeq, _, _, err := proto.DecodeAckStateRep(body)
+	if err != nil {
+		return
+	}
+	if generation != c.AckRelay.Generation(consumerID) {
+		// Local hot state is stale relative to the broker — wipe wholesale
+		// rather than reconcile entry-by-entry (matches AckRelay::ensure).
+		c.AckRelay.EnsureGeneration(consumerID, generation)
+		return
+	}
+
+	c.AckRelay.ConfirmUpTo(consumerID, cursor)
+	if lowSeq > 0 {
+		// Below the broker's retention floor — will never be confirmable.
+		c.AckRelay.ConfirmUpTo(consumerID, lowSeq-1)
+	}
+
+	seqs := c.AckRelay.PendingSeqs(consumerID)
+	for start := 0; start < len(seqs); start += proto.AckBatchMaxSeqs {
+		end := start + proto.AckBatchMaxSeqs
+		if end > len(seqs) {
+			end = len(seqs)
+		}
+		seq := c.NextSeq()
+		frame := proto.EncodeAckBatch(seq, consumerID, generation, 0, seqs[start:end])
+		_ = c.Send(frame)
+	}
+}
+
+// handleAckBatchResp purges the broker-confirmed range from the hot tier.
+// Mirrors dispatch_ack_batch_resp in the Rust client.
+func (c *Connection) handleAckBatchResp(body []byte) {
+	if c.AckRelay == nil {
+		return
+	}
+	consumerID, newCursor, _, _, _, _, _, err := proto.DecodeAckBatchResp(body)
+	if err != nil {
+		return
+	}
+	c.AckRelay.ConfirmUpTo(consumerID, newCursor)
 }
 
 func (c *Connection) dispatchBatch(frame, body []byte) {

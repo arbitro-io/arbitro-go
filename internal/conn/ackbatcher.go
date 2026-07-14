@@ -113,12 +113,30 @@ func (ab *AckBatcher) sendBatchAck(consumerID uint32, entries []proto.AckEntry) 
 	if len(entries) == 1 {
 		// Single ack — encode directly (no batch overhead).
 		frame := encodeSingleAckInline(ab.conn.NextSeq(), consumerID, entries[0])
-		_ = ab.conn.Send(frame)
+		if err := ab.conn.Send(frame); err != nil {
+			ab.recordFailed(consumerID, entries)
+		}
 		return
 	}
 	seq := ab.conn.NextSeq()
 	frame := proto.EncodeBatchAck(seq, consumerID, entries)
-	_ = ab.conn.Send(frame)
+	if err := ab.conn.Send(frame); err != nil {
+		ab.recordFailed(consumerID, entries)
+	}
+}
+
+// recordFailed defers acks that failed to reach the wire (write channel
+// backpressure, mid-flight disconnect) into the ack-reliability hot tier
+// (G01) instead of silently dropping them. The sweep goroutine — or the
+// reconnect supervisor's AckStateReq replay — retries them later.
+func (ab *AckBatcher) recordFailed(consumerID uint32, entries []proto.AckEntry) {
+	relay := ab.conn.AckRelay
+	if relay == nil {
+		return
+	}
+	for _, e := range entries {
+		relay.Record(consumerID, e.Seq)
+	}
 }
 
 // encodeSingleAckInline encodes a single ack without allocation from a pool.
