@@ -67,16 +67,16 @@ func EncodeUnsubscribe(seq uint64, consumerID uint32) ([]byte, error) {
 // --- Stream management ---
 
 type createStreamPayload struct {
-	Name                 []int  `json:"name"`
-	Filter               []int  `json:"filter"`
-	MaxMsgs              uint64 `json:"max_msgs"`
-	MaxBytes             uint64 `json:"max_bytes"`
-	MaxAgeSecs           uint64 `json:"max_age_secs"`
-	Replicas             uint32 `json:"replicas"`
-	JournalKind          uint32 `json:"journal_kind"`
-	Retention            uint32 `json:"retention"`
-	Discard              uint32 `json:"discard"`
-	IdempotencyWindowMs  uint32 `json:"idempotency_window_ms"`
+	Name                []int  `json:"name"`
+	Filter              []int  `json:"filter"`
+	MaxMsgs             uint64 `json:"max_msgs"`
+	MaxBytes            uint64 `json:"max_bytes"`
+	MaxAgeSecs          uint64 `json:"max_age_secs"`
+	Replicas            uint32 `json:"replicas"`
+	JournalKind         uint32 `json:"journal_kind"`
+	Retention           uint32 `json:"retention"`
+	Discard             uint32 `json:"discard"`
+	IdempotencyWindowMs uint32 `json:"idempotency_window_ms"`
 }
 
 func EncodeCreateStream(seq uint64, name, filter []byte, maxMsgs, maxBytes, maxAgeSecs uint64, replicas, journalKind, retention, discard, idempotencyWindowMs uint32) ([]byte, error) {
@@ -178,6 +178,16 @@ type createConsumerPayload struct {
 }
 
 func EncodeCreateConsumer(seq uint64, streamID uint32, name, group, subject []byte, maxInflight uint16, ackPolicy, deliverPolicy, deliverMode, ackWaitMs uint32, startSeq uint64, subjectLimits []SubjectLimitJSON) ([]byte, error) {
+	// A nil subjectLimits marshals to JSON `null`, but the broker's
+	// cold::CreateConsumer.subject_limits field is a plain (non-Option)
+	// Vec<SubjectLimit> — serde rejects `null` there and the broker replies
+	// with a generic InternalError (0x0502), not a helpful parse error. An
+	// empty-but-non-nil slice marshals to `[]`, which deserializes cleanly
+	// as an empty Vec. Every caller that doesn't set per-subject limits
+	// (nil is the natural zero value) benefits from this normalization.
+	if subjectLimits == nil {
+		subjectLimits = []SubjectLimitJSON{}
+	}
 	return packCold(ActionCreateConsumer, seq, createConsumerPayload{
 		StreamID:      streamID,
 		Name:          bytesArr(name),
@@ -305,7 +315,9 @@ type ConsumerListEntry struct {
 }
 
 // DecodeListStreamsBody parses the ListStreams reply body:
-//   count u32 LE, then N × (wire_id u32 LE, name_len u16 LE, name bytes)
+//
+//	count u32 LE, then N × (wire_id u32 LE, name_len u16 LE, name bytes)
+//
 // This mirrors dispatch_v2::v2_list_streams on the server side.
 func DecodeListStreamsBody(body []byte) ([]StreamListEntry, error) {
 	if len(body) < 4 {
@@ -333,7 +345,9 @@ func DecodeListStreamsBody(body []byte) ([]StreamListEntry, error) {
 }
 
 // DecodeListConsumersBody parses the ListConsumers reply body:
-//   count u32 LE, then N × (consumer_id u32, stream_id u32, queue_id u32, paused u8) = 13B
+//
+//	count u32 LE, then N × (consumer_id u32, stream_id u32, queue_id u32, paused u8) = 13B
+//
 // This mirrors dispatch_v2::v2_list_consumers on the server side.
 func DecodeListConsumersBody(body []byte) ([]ConsumerListEntry, error) {
 	if len(body) < 4 {

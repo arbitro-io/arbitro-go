@@ -89,6 +89,10 @@ const (
 	EntryFlagRetain         byte = 0x01
 	EntryFlagCompressed     byte = 0x02
 	EntryFlagNoBackpressure byte = 0x04
+	// EntryFlagHasHeaders marks a payload that is already in ExtendedPayload
+	// format (user payload + TLV headers block, see internal/proto/msgheaders.go).
+	// Mirrors arbitro-proto v2::header::entry_flag::HAS_HEADERS (1 << 4).
+	EntryFlagHasHeaders byte = 0x10
 )
 
 // Handshake capabilities bitmask (uint16 LE at hello offset +6)
