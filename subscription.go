@@ -248,6 +248,10 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 }
 
 func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (uint32, error) {
+	if err := cfg.Validate(); err != nil {
+		return 0, err
+	}
+
 	// Try to get existing consumer first
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {

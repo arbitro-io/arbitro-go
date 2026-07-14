@@ -9,6 +9,7 @@ package ackrel
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,10 +17,16 @@ import (
 // consumer, plus the generation counter bumped on reconnect. A generation
 // change wipes the pending set wholesale — deferred acks don't survive a
 // session change (matches Rust AckRelay::ensure's purge invariant).
+//
+// oldestTs is the insertion time of the oldest currently-pending seq — used
+// by the TTL sweep (ExpireOlderThan) exactly like the Rust ConsumerPending's
+// oldest_ts_ms: rather than tracking a per-seq timestamp, the whole set is
+// considered expired together once its oldest entry crosses the TTL.
 type consumerState struct {
 	mu         sync.Mutex
 	generation uint32
 	pending    map[uint64]struct{}
+	oldestTs   time.Time
 }
 
 // Relay is one instance per Client (NOT per Connection — it must survive
@@ -35,8 +42,13 @@ type Relay struct {
 	send func(consumerID, generation uint32, seqs []uint64)
 
 	sweepInterval time.Duration
+	expireTTL     atomic.Int64 // time.Duration; 0 disables the TTL sweep
 	stopCh        chan struct{}
 	stopOnce      sync.Once
+
+	// Metrics (G14) — cumulative counters read by Client.Metrics().
+	confirmedTotal atomic.Uint64
+	expiredTotal   atomic.Uint64
 }
 
 // NewRelay creates a Relay. send transmits an AckBatch frame for
@@ -85,7 +97,12 @@ func (r *Relay) stateIfExists(consumerID uint32) *consumerState {
 func (r *Relay) Record(consumerID uint32, seq uint64) {
 	st := r.state(consumerID)
 	st.mu.Lock()
-	st.pending[seq] = struct{}{}
+	if _, exists := st.pending[seq]; !exists {
+		st.pending[seq] = struct{}{}
+		if st.oldestTs.IsZero() {
+			st.oldestTs = time.Now()
+		}
+	}
 	st.mu.Unlock()
 }
 
@@ -98,10 +115,20 @@ func (r *Relay) Confirm(consumerID uint32, seqs []uint64) {
 		return
 	}
 	st.mu.Lock()
+	removed := 0
 	for _, s := range seqs {
-		delete(st.pending, s)
+		if _, ok := st.pending[s]; ok {
+			delete(st.pending, s)
+			removed++
+		}
+	}
+	if len(st.pending) == 0 {
+		st.oldestTs = time.Time{}
 	}
 	st.mu.Unlock()
+	if removed > 0 {
+		r.confirmedTotal.Add(uint64(removed))
+	}
 }
 
 // ConfirmUpTo purges every deferred seq <= newCursor for consumerID —
@@ -113,13 +140,19 @@ func (r *Relay) ConfirmUpTo(consumerID uint32, newCursor uint64) int {
 		return 0
 	}
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	removed := 0
 	for s := range st.pending {
 		if s <= newCursor {
 			delete(st.pending, s)
 			removed++
 		}
+	}
+	if len(st.pending) == 0 {
+		st.oldestTs = time.Time{}
+	}
+	st.mu.Unlock()
+	if removed > 0 {
+		r.confirmedTotal.Add(uint64(removed))
 	}
 	return removed
 }
@@ -162,6 +195,7 @@ func (r *Relay) EnsureGeneration(consumerID uint32, generation uint32) {
 	if st.generation != generation {
 		st.generation = generation
 		st.pending = make(map[uint64]struct{})
+		st.oldestTs = time.Time{}
 	}
 	st.mu.Unlock()
 }
@@ -174,6 +208,7 @@ func (r *Relay) BumpGeneration(consumerID uint32) uint32 {
 	st.mu.Lock()
 	st.generation++
 	st.pending = make(map[uint64]struct{})
+	st.oldestTs = time.Time{}
 	gen := st.generation
 	st.mu.Unlock()
 	return gen
@@ -228,6 +263,68 @@ func (r *Relay) HotCount() uint64 {
 	return total
 }
 
+// ConfirmedTotal returns the cumulative count of hot-tier entries purged by
+// Confirm/ConfirmUpTo (broker confirmation) — feeds the acks_confirmed
+// metrics counter (G14).
+func (r *Relay) ConfirmedTotal() uint64 {
+	return r.confirmedTotal.Load()
+}
+
+// ExpiredTotal returns the cumulative count of hot-tier entries dropped by
+// the TTL sweep without ever being broker-confirmed — feeds the
+// acks_expired metrics counter (G14).
+func (r *Relay) ExpiredTotal() uint64 {
+	return r.expiredTotal.Load()
+}
+
+// SetExpireTTL enables (ttl > 0) or disables (ttl <= 0) the TTL sweep: a
+// consumer's entire deferred set is dropped, uncounted as confirmed, once
+// its oldest entry has been pending longer than ttl. Mirrors the Rust hot
+// tier's ConsumerPending::expire_older_than (pending.rs) — same
+// whole-set-at-once semantics, since only the oldest timestamp is tracked
+// per consumer, not per seq.
+func (r *Relay) SetExpireTTL(ttl time.Duration) {
+	r.expireTTL.Store(int64(ttl))
+}
+
+// ExpireOlderThan drops the entire deferred set for any consumer whose
+// oldest pending entry is older than ttl, and returns the total number of
+// entries dropped. Safe to call directly (e.g. from tests) independent of
+// the sweep goroutine's periodic invocation.
+func (r *Relay) ExpireOlderThan(ttl time.Duration) int {
+	if ttl <= 0 {
+		return 0
+	}
+	cutoff := time.Now().Add(-ttl)
+
+	r.mu.RLock()
+	ids := make([]uint32, 0, len(r.byID))
+	for cid := range r.byID {
+		ids = append(ids, cid)
+	}
+	r.mu.RUnlock()
+
+	total := 0
+	for _, cid := range ids {
+		st := r.stateIfExists(cid)
+		if st == nil {
+			continue
+		}
+		st.mu.Lock()
+		if !st.oldestTs.IsZero() && st.oldestTs.Before(cutoff) {
+			removed := len(st.pending)
+			st.pending = make(map[uint64]struct{})
+			st.oldestTs = time.Time{}
+			total += removed
+		}
+		st.mu.Unlock()
+	}
+	if total > 0 {
+		r.expiredTotal.Add(uint64(total))
+	}
+	return total
+}
+
 // Close stops the sweep goroutine. Safe to call multiple times.
 func (r *Relay) Close() {
 	r.stopOnce.Do(func() { close(r.stopCh) })
@@ -242,6 +339,9 @@ func (r *Relay) sweepLoop() {
 			return
 		case <-ticker.C:
 			r.sweepOnce()
+			if ttl := time.Duration(r.expireTTL.Load()); ttl > 0 {
+				r.ExpireOlderThan(ttl)
+			}
 		}
 	}
 }

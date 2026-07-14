@@ -119,3 +119,91 @@ func TestHotCount(t *testing.T) {
 		t.Fatalf("HotCount = %d, want 3", got)
 	}
 }
+
+func TestConfirmedTotalAccumulates(t *testing.T) {
+	r := NewRelay(0, nil)
+	defer r.Close()
+
+	r.Record(1, 10)
+	r.Record(1, 20)
+	r.Record(1, 30)
+
+	if got := r.ConfirmedTotal(); got != 0 {
+		t.Fatalf("ConfirmedTotal before any confirm = %d, want 0", got)
+	}
+
+	r.ConfirmUpTo(1, 20) // confirms 10, 20
+	if got := r.ConfirmedTotal(); got != 2 {
+		t.Fatalf("ConfirmedTotal = %d, want 2", got)
+	}
+
+	r.Confirm(1, []uint64{30}) // confirms 30
+	if got := r.ConfirmedTotal(); got != 3 {
+		t.Fatalf("ConfirmedTotal = %d, want 3", got)
+	}
+}
+
+func TestExpireOlderThanDropsStaleEntries(t *testing.T) {
+	r := NewRelay(0, nil)
+	defer r.Close()
+
+	r.Record(1, 100)
+	time.Sleep(20 * time.Millisecond)
+
+	// TTL longer than elapsed time: nothing expires yet.
+	if got := r.ExpireOlderThan(1 * time.Hour); got != 0 {
+		t.Fatalf("ExpireOlderThan(1h) = %d, want 0 (too young)", got)
+	}
+	if len(r.PendingSeqs(1)) != 1 {
+		t.Fatal("entry should still be pending")
+	}
+
+	// TTL shorter than elapsed time: the whole set expires together.
+	removed := r.ExpireOlderThan(10 * time.Millisecond)
+	if removed != 1 {
+		t.Fatalf("ExpireOlderThan(10ms) = %d, want 1", removed)
+	}
+	if len(r.PendingSeqs(1)) != 0 {
+		t.Fatal("pending set should be empty after expiry")
+	}
+	if got := r.ExpiredTotal(); got != 1 {
+		t.Fatalf("ExpiredTotal = %d, want 1", got)
+	}
+	// Expired entries must not also count as confirmed.
+	if got := r.ConfirmedTotal(); got != 0 {
+		t.Fatalf("ConfirmedTotal after expiry = %d, want 0", got)
+	}
+}
+
+func TestExpireOlderThanDisabledByZeroTTL(t *testing.T) {
+	r := NewRelay(0, nil)
+	defer r.Close()
+
+	r.Record(1, 1)
+	if got := r.ExpireOlderThan(0); got != 0 {
+		t.Fatalf("ExpireOlderThan(0) = %d, want 0 (disabled)", got)
+	}
+	if len(r.PendingSeqs(1)) != 1 {
+		t.Fatal("entry should be untouched when TTL is disabled")
+	}
+}
+
+func TestRecordAfterGenerationBumpGetsFreshTimestamp(t *testing.T) {
+	r := NewRelay(0, nil)
+	defer r.Close()
+
+	r.Record(1, 1)
+	time.Sleep(20 * time.Millisecond)
+	r.BumpGeneration(1) // wipes pending + oldestTs
+
+	r.Record(1, 2) // fresh entry post-wipe
+	// Immediately after the wipe+re-record, a long-ago TTL should NOT expire
+	// the fresh entry — proves oldestTs was reset by BumpGeneration rather
+	// than staying stuck at the pre-wipe timestamp.
+	if got := r.ExpireOlderThan(10 * time.Millisecond); got != 0 {
+		t.Fatalf("ExpireOlderThan = %d, want 0 (fresh entry, not stale)", got)
+	}
+	if len(r.PendingSeqs(1)) != 1 {
+		t.Fatal("fresh entry should still be pending")
+	}
+}

@@ -234,14 +234,21 @@ func (c *Client) DeleteConsumer(ctx context.Context, stream, name string) error 
 	return c.checkReply(reply)
 }
 
-// GetPending returns the number of unacknowledged messages for a consumer.
+// GetPending returns the number of unacknowledged (delivered but not yet
+// acked) messages for a consumer — a live broker round-trip via
+// ConsumerStats (G13), equivalent to NATS JetStream's num_ack_pending.
+// Mirrors arbitro-client-tokio's Client::get_pending (client.rs:703).
 func (c *Client) GetPending(ctx context.Context, stream, name string) (uint64, error) {
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
 		return 0, err
 	}
+	consumerID, err := c.resolveConsumerID(ctx, streamID, name)
+	if err != nil {
+		return 0, err
+	}
 	seq := c.getConn().NextSeq()
-	frame, err := proto.EncodeGetConsumer(seq, streamID, []byte(name))
+	frame, err := proto.EncodeConsumerStats(seq, consumerID)
 	if err != nil {
 		return 0, err
 	}
@@ -252,8 +259,12 @@ func (c *Client) GetPending(ctx context.Context, stream, name string) (uint64, e
 	if err := c.checkReply(reply); err != nil {
 		return 0, err
 	}
-	// TODO: parse consumer info JSON to extract pending count
-	return 0, nil
+	body := reply[proto.HeaderSize:]
+	if len(body) < 8 {
+		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "get pending: reply body too short"}
+	}
+	// RepOk body packs the live pending-ack count in place of ref_seq.
+	return proto.RepOkRefSeq(body), nil
 }
 
 // ConsumerInfo returns metadata about a consumer.

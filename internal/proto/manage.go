@@ -245,6 +245,19 @@ func EncodeListConsumers(seq uint64, streamID, offset, limit uint32) ([]byte, er
 	})
 }
 
+type consumerStatsPayload struct {
+	ConsumerID uint32 `json:"consumer_id"`
+}
+
+// EncodeConsumerStats sends a ConsumerStats request (action 0x0505). The
+// broker's reply is a RepOk whose 8-byte body packs the live pending-ack
+// count in place of the usual ref_seq — see arbitro-client-tokio's
+// client.rs get_pending / manage/mod.rs consumer_stats. Read the count back
+// with RepOkRefSeq, same as any other RepOk body.
+func EncodeConsumerStats(seq uint64, consumerID uint32) ([]byte, error) {
+	return packCold(ActionConsumerStats, seq, consumerStatsPayload{ConsumerID: consumerID})
+}
+
 func EncodePauseConsumer(seq uint64, streamID uint32, name []byte) ([]byte, error) {
 	return packCold(ActionPauseConsumer, seq, getConsumerPayload{
 		StreamID: streamID,

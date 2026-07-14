@@ -3,6 +3,7 @@ package conn
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -66,12 +67,26 @@ type Config struct {
 	// KeepAliveTimeout is how long to wait without a Pong before the
 	// connection is declared dead and closed.
 	KeepAliveTimeout time.Duration
+
+	// TLS, when non-nil, upgrades the broker connection to TLS (G15). Nil
+	// (the zero value) dials a plain TCP connection, matching prior
+	// behavior when WithTLS was never wired into the dial path.
+	TLS *tls.Config
 }
 
-// Dial creates a new connection to the broker.
+// Dial creates a new connection to the broker. If cfg.TLS is set, the
+// connection is established over TLS via tls.DialWithDialer instead of a
+// plain net.Dialer — fixes WithTLS(cfg) being a silent no-op (G15).
 func Dial(ctx context.Context, cfg Config) (*Connection, error) {
 	d := net.Dialer{Timeout: cfg.Timeout}
-	conn, err := d.DialContext(ctx, "tcp", cfg.Addr)
+
+	var conn net.Conn
+	var err error
+	if cfg.TLS != nil {
+		conn, err = tls.DialWithDialer(&d, "tcp", cfg.Addr, cfg.TLS)
+	} else {
+		conn, err = d.DialContext(ctx, "tcp", cfg.Addr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("arbitro: dial %s: %w", cfg.Addr, err)
 	}

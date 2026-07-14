@@ -4,26 +4,27 @@ import "fmt"
 
 // Error codes from the broker (wire-level uint16).
 const (
-	ErrCodeUnknownAction      uint16 = 0x0001
-	ErrCodeBufferTooShort     uint16 = 0x0002
-	ErrCodeInvalidLength      uint16 = 0x0003
-	ErrCodeStreamNotFound     uint16 = 0x0010
-	ErrCodeStreamAlreadyExists uint16 = 0x0011
-	ErrCodeStreamFull         uint16 = 0x0012
-	ErrCodeStreamFilterOverlap uint16 = 0x0013
-	ErrCodeSubjectNotFound    uint16 = 0x0014
-	ErrCodeIdempotencyDuplicate uint16 = 0x0015
-	ErrCodeConsumerNotFound     uint16 = 0x0020
+	ErrCodeUnknownAction         uint16 = 0x0001
+	ErrCodeBufferTooShort        uint16 = 0x0002
+	ErrCodeInvalidLength         uint16 = 0x0003
+	ErrCodeStreamNotFound        uint16 = 0x0010
+	ErrCodeStreamAlreadyExists   uint16 = 0x0011
+	ErrCodeStreamFull            uint16 = 0x0012
+	ErrCodeStreamFilterOverlap   uint16 = 0x0013
+	ErrCodeSubjectNotFound       uint16 = 0x0014
+	ErrCodeIdempotencyDuplicate  uint16 = 0x0015
+	ErrCodeConsumerNotFound      uint16 = 0x0020
 	ErrCodeConsumerAlreadyExists uint16 = 0x0021
 	ErrCodeConsumerFilterOverlap uint16 = 0x0022
-	ErrCodeInvalidSequence    uint16 = 0x0030
-	ErrCodeMaxInflightReached uint16 = 0x0031
-	ErrCodeAckTimeout         uint16 = 0x0032
-	ErrCodeAuthRequired       uint16 = 0x0040
-	ErrCodeAuthFailed         uint16 = 0x0041
-	ErrCodeServerShuttingDown uint16 = 0x0050
-	ErrCodeInternalError      uint16 = 0x0051
-	ErrCodeTimeout            uint16 = 0x00FF // client-side timeout (not from broker)
+	ErrCodeInvalidSequence       uint16 = 0x0030
+	ErrCodeMaxInflightReached    uint16 = 0x0031
+	ErrCodeAckTimeout            uint16 = 0x0032
+	ErrCodeAuthRequired          uint16 = 0x0040
+	ErrCodeAuthFailed            uint16 = 0x0041
+	ErrCodeServerShuttingDown    uint16 = 0x0050
+	ErrCodeInternalError         uint16 = 0x0051
+	ErrCodeTimeout               uint16 = 0x00FF // client-side timeout (not from broker)
+	ErrCodeInvalidConfig         uint16 = 0x00FE // client-side ConsumerConfig.Validate() failure (not from broker)
 )
 
 // codeMessages maps error codes to human-readable descriptions.

@@ -95,7 +95,10 @@ type Client struct {
 	ackRelay  *ackrel.Relay
 	seenCache *ackrel.SeenCache
 
-	// metrics
+	// metrics. AcksDeferred/AcksConfirmed/AcksExpired (G14) are NOT tracked
+	// here as separate atomics — they're sourced live from ackRelay
+	// (HotCount/ConfirmedTotal/ExpiredTotal) in Metrics(), since ackRelay is
+	// already the single source of truth for that state.
 	publishesSent  atomic.Uint64
 	deliveriesRecv atomic.Uint64
 	acksSent       atomic.Uint64
@@ -103,9 +106,6 @@ type Client struct {
 	reconnects     atomic.Uint64
 	activeSubs     atomic.Uint64
 	publishErrors  atomic.Uint64
-	acksDeferred   atomic.Uint64
-	acksConfirmed  atomic.Uint64
-	acksExpired    atomic.Uint64
 
 	// Reconnect / lifecycle state.
 	closing atomic.Bool // Close() was called by the user — supervisor exits quietly.
@@ -131,6 +131,7 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		Timeout:           o.timeout,
 		KeepAliveInterval: o.keepAlive.Interval,
 		KeepAliveTimeout:  o.keepAlive.Timeout,
+		TLS:               o.tlsConfig,
 	}
 
 	c, err := conn.Dial(ctx, dialCfg)
@@ -155,6 +156,10 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 	}
 	client.seenCache = ackrel.NewSeenCache()
 	client.ackRelay = ackrel.NewRelay(100*time.Millisecond, client.sendAckBatch)
+	// Deferred acks older than 60s without broker confirmation are dropped
+	// (surfaced via the AcksExpired metric, G14) rather than retried
+	// forever — mirrors the Rust hot tier's TTL sweep (ackrel expire()).
+	client.ackRelay.SetExpireTTL(60 * time.Second)
 	client.reqInstanceID = newReqInstanceID()
 	client.reqSubs = make(map[uint32]*Subscription)
 	client.connPtr.Store(c)
@@ -233,6 +238,12 @@ func (c *Client) sendAckBatch(consumerID, generation uint32, seqs []uint64) {
 
 // Metrics returns a point-in-time snapshot of client counters.
 func (c *Client) Metrics() MetricsSnapshot {
+	var acksDeferred, acksConfirmed, acksExpired uint64
+	if c.ackRelay != nil {
+		acksDeferred = c.ackRelay.HotCount()
+		acksConfirmed = c.ackRelay.ConfirmedTotal()
+		acksExpired = c.ackRelay.ExpiredTotal()
+	}
 	return MetricsSnapshot{
 		PublishesSent:   c.publishesSent.Load(),
 		DeliveriesRecv:  c.deliveriesRecv.Load(),
@@ -242,6 +253,10 @@ func (c *Client) Metrics() MetricsSnapshot {
 		PendingRequests: uint64(c.getConn().PendingLen()),
 		ActiveSubs:      c.activeSubs.Load(),
 		BatchFramesRecv: c.getConn().BatchRecv.Load(),
+		PublishErrors:   c.publishErrors.Load(),
+		AcksDeferred:    acksDeferred,
+		AcksConfirmed:   acksConfirmed,
+		AcksExpired:     acksExpired,
 	}
 }
 
@@ -254,6 +269,7 @@ func (c *Client) Publish(ctx context.Context, stream, subject string, payload []
 
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
+		c.publishErrors.Add(1)
 		return err
 	}
 
@@ -263,11 +279,16 @@ func (c *Client) Publish(ctx context.Context, stream, subject string, payload []
 
 	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
+		c.publishErrors.Add(1)
 		return err
 	}
 
+	if err := c.checkReply(reply); err != nil {
+		c.publishErrors.Add(1)
+		return err
+	}
 	c.publishesSent.Add(1)
-	return c.checkReply(reply)
+	return nil
 }
 
 // PublishAsync sends a message without waiting for confirmation (fire-and-forget).
@@ -282,7 +303,10 @@ func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...Pu
 	subj := c.prefixed(subject)
 	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subj), []byte(po.msgID), payload, proto.FlagNone)
-	_ = c.getConn().Send(frame)
+	if err := c.getConn().Send(frame); err != nil {
+		c.publishErrors.Add(1)
+		return
+	}
 	c.publishesSent.Add(1)
 }
 
@@ -294,6 +318,8 @@ func (c *Client) PublishFireAndForget(streamID uint32, subject string, payload [
 	err := c.getConn().Send(frame)
 	if err == nil {
 		c.publishesSent.Add(1)
+	} else {
+		c.publishErrors.Add(1)
 	}
 	return err
 }
@@ -334,7 +360,10 @@ func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
 		}
 		seq := c.getConn().NextSeq()
 		frame := proto.EncodePublishBatch(seq, streamID, protoEntries[start:end], proto.FlagNone)
-		_ = c.getConn().Send(frame)
+		if err := c.getConn().Send(frame); err != nil {
+			c.publishErrors.Add(1)
+			return
+		}
 	}
 	c.publishesSent.Add(1)
 }
@@ -345,10 +374,12 @@ func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
 // remaining chunks are fire-and-forget, matching the Rust client.
 func (c *Client) PublishBatch(ctx context.Context, stream string, entries []BatchEntry) (uint64, error) {
 	if len(entries) == 0 {
+		c.publishErrors.Add(1)
 		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "publish batch: empty entries"}
 	}
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
+		c.publishErrors.Add(1)
 		return 0, err
 	}
 
@@ -364,14 +395,17 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 
 	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
+		c.publishErrors.Add(1)
 		return 0, err
 	}
 	if err := c.checkReply(reply); err != nil {
+		c.publishErrors.Add(1)
 		return 0, err
 	}
 
 	body := reply[proto.HeaderSize:]
 	if len(body) < 8 {
+		c.publishErrors.Add(1)
 		return 0, &ArbitroError{Code: ErrCodeInternalError, Message: "publish batch: reply body too short"}
 	}
 	firstSeq := proto.RepOkRefSeq(body)
@@ -385,10 +419,12 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 		s := c.getConn().NextSeq()
 		f := proto.EncodePublishBatch(s, streamID, protoEntries[start:end], proto.FlagNone)
 		if err := c.getConn().Send(f); err != nil {
+			c.publishErrors.Add(1)
 			return firstSeq, err
 		}
 	}
 
+	c.publishesSent.Add(1)
 	return firstSeq, nil
 }
 
@@ -396,6 +432,7 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 func (c *Client) PublishDelayed(ctx context.Context, stream, subject string, payload []byte, delay time.Duration) error {
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
+		c.publishErrors.Add(1)
 		return err
 	}
 
@@ -405,10 +442,15 @@ func (c *Client) PublishDelayed(ctx context.Context, stream, subject string, pay
 
 	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
+		c.publishErrors.Add(1)
+		return err
+	}
+	if err := c.checkReply(reply); err != nil {
+		c.publishErrors.Add(1)
 		return err
 	}
 	c.publishesSent.Add(1)
-	return c.checkReply(reply)
+	return nil
 }
 
 // PublishWithHeaders sends a message carrying user-defined TLV headers
@@ -419,6 +461,7 @@ func (c *Client) PublishDelayed(ctx context.Context, stream, subject string, pay
 func (c *Client) PublishWithHeaders(ctx context.Context, stream, subject string, headers map[string][]byte, payload []byte) error {
 	streamID, err := c.resolveStreamID(ctx, stream)
 	if err != nil {
+		c.publishErrors.Add(1)
 		return err
 	}
 
@@ -438,10 +481,15 @@ func (c *Client) PublishWithHeaders(ctx context.Context, stream, subject string,
 
 	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
+		c.publishErrors.Add(1)
+		return err
+	}
+	if err := c.checkReply(reply); err != nil {
+		c.publishErrors.Add(1)
 		return err
 	}
 	c.publishesSent.Add(1)
-	return c.checkReply(reply)
+	return nil
 }
 
 // Request performs a standalone request/reply RPC: it publishes payload to
