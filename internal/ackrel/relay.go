@@ -4,6 +4,10 @@
 // silently lost, plus a bounded redelivery-dedup cache (G18).
 //
 // Mirrors arbitro-client-tokio's ackrel::{AckRelay, ConsumerPending, SeenCache}.
+//
+// Intentionally out of scope: the Rust cold tier (ackrel/cold.rs, SQLite WAL
+// persistence for ack survival across process restart) is not ported here.
+// Consumers requiring restart durability should design idempotent handlers.
 package ackrel
 
 import (
