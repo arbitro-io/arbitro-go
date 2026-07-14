@@ -17,6 +17,24 @@ type clientOptions struct {
 	prefix    string
 	tlsConfig *tls.Config
 	logger    *slog.Logger
+	keepAlive KeepAlive
+}
+
+// KeepAlive configures the client heartbeat / dead-connection watchdog.
+// Mirrors the Rust client's conn::heartbeat module: a Ping (action 0x0601,
+// header-only body) is sent every Interval; if no Pong is observed for
+// Timeout, the connection is declared dead and closed (which in turn feeds
+// the reconnect supervisor).
+type KeepAlive struct {
+	Interval time.Duration
+	Timeout  time.Duration
+}
+
+func defaultKeepAlive() KeepAlive {
+	return KeepAlive{
+		Interval: 30 * time.Second,
+		Timeout:  60 * time.Second,
+	}
 }
 
 func defaultOptions() clientOptions {
@@ -25,6 +43,15 @@ func defaultOptions() clientOptions {
 		reconnect:     true,
 		maxRetries:    10,
 		retryInterval: 500 * time.Millisecond,
+		keepAlive:     defaultKeepAlive(),
+	}
+}
+
+// WithKeepAlive configures the heartbeat interval and dead-connection
+// timeout. Pass interval<=0 to disable the heartbeat goroutine entirely.
+func WithKeepAlive(interval, timeout time.Duration) Option {
+	return func(o *clientOptions) {
+		o.keepAlive = KeepAlive{Interval: interval, Timeout: timeout}
 	}
 }
 

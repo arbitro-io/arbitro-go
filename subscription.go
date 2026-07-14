@@ -48,9 +48,22 @@ func (s *Subscription) Close() {
 		close(s.closed)
 		s.client.unregisterSubscription(s.consumerID)
 		// Send Unsubscribe frame
-		seq := s.client.conn.NextSeq()
+		seq := s.client.getConn().NextSeq()
 		frame, _ := proto.EncodeUnsubscribe(seq, s.consumerID)
-		_ = s.client.conn.Send(frame)
+		_ = s.client.getConn().Send(frame)
+		s.client.activeSubs.Add(^uint64(0)) // decrement
+		close(s.ch)
+	})
+}
+
+// closeLocal terminates the subscription without a network round trip. Used
+// by the reconnect supervisor (G02) when the client is permanently dead
+// (reconnect disabled, or max retries exhausted) — there is no live
+// connection to send an Unsubscribe frame over.
+func (s *Subscription) closeLocal() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.client.unregisterSubscription(s.consumerID)
 		s.client.activeSubs.Add(^uint64(0)) // decrement
 		close(s.ch)
 	})
@@ -108,9 +121,9 @@ func (m *Msg) Reply(payload []byte) {
 	}
 	targetStreamID := binary.LittleEndian.Uint32(rt[1:5])
 	replySubject := rt[5:]
-	seq := m.client.conn.NextSeq()
+	seq := m.client.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, targetStreamID, replySubject, nil, payload, proto.FlagAckReq)
-	_ = m.client.conn.Send(frame)
+	_ = m.client.getConn().Send(frame)
 }
 
 // Seq returns the delivery sequence number.
@@ -135,7 +148,7 @@ func (m *Msg) Ack() {
 		return
 	}
 	m.acked = true
-	m.client.conn.AckBatch.Ack(m.consumerID, m.subjectHash, m.seq)
+	m.client.getConn().AckBatch.Ack(m.consumerID, m.subjectHash, m.seq)
 	m.client.acksSent.Add(1)
 }
 
@@ -145,9 +158,9 @@ func (m *Msg) Nack() {
 		return
 	}
 	m.acked = true
-	seq := m.client.conn.NextSeq()
+	seq := m.client.getConn().NextSeq()
 	frame := proto.EncodeNack(seq, m.consumerID, m.subjectHash, m.seq)
-	_ = m.client.conn.Send(frame)
+	_ = m.client.getConn().Send(frame)
 	m.client.nacksSent.Add(1)
 }
 
@@ -157,14 +170,14 @@ func (m *Msg) NackDelay(d time.Duration) {
 		return
 	}
 	m.acked = true
-	seq := m.client.conn.NextSeq()
+	seq := m.client.getConn().NextSeq()
 	entry := proto.NackEntry{
 		Seq:         m.seq,
 		SubjectHash: m.subjectHash,
 		DelayMs:     uint32(d.Milliseconds()),
 	}
 	frame := proto.EncodeBatchNack(seq, m.consumerID, []proto.NackEntry{entry})
-	_ = m.client.conn.Send(frame)
+	_ = m.client.getConn().Send(frame)
 	m.client.nacksSent.Add(1)
 }
 
@@ -209,21 +222,24 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 		closed:     make(chan struct{}),
 	}
 
-	// Register subscription in dispatch table
-	c.registerSubscription(consumerID, sub)
-	c.activeSubs.Add(1)
-
 	// Send Subscribe frame
 	var filters [][]byte
 	if cfg.Filter != "" {
 		filters = [][]byte{[]byte(c.prefixed(cfg.Filter))}
 	}
-	seq := c.conn.NextSeq()
+
+	// Register subscription in dispatch table, and stash the filters so the
+	// reconnect supervisor (G02) can replay this Subscribe against a freshly
+	// redialed connection.
+	c.registerSubscription(consumerID, sub, filters)
+	c.activeSubs.Add(1)
+
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeSubscribe(seq, consumerID, filters)
 	if err != nil {
 		return nil, err
 	}
-	_, err = c.conn.SendExpectReply(ctx, frame, seq)
+	_, err = c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +276,7 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 		deliverMode = 0 // Fanout
 	}
 
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeCreateConsumer(
 		seq, streamID,
 		[]byte(name), []byte(group), []byte(c.prefixed(cfg.Filter)),
@@ -272,7 +288,7 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 		return 0, err
 	}
 
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -291,12 +307,26 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 	return consumerID, nil
 }
 
-func (c *Client) registerSubscription(consumerID uint32, sub *Subscription) {
+// registerSubscription stores the subscription for delivery dispatch and
+// remembers its filters (guarded by subFilterMu) so the reconnect supervisor
+// can replay the Subscribe frame after a redial. filters may be nil for
+// subscriptions (e.g. service consumers) that pass their own filter list
+// directly at the call site.
+func (c *Client) registerSubscription(consumerID uint32, sub *Subscription, filters [][]byte) {
 	c.subs.Store(consumerID, sub)
+	c.subFilterMu.Lock()
+	if c.subFilters == nil {
+		c.subFilters = make(map[uint32][][]byte)
+	}
+	c.subFilters[consumerID] = filters
+	c.subFilterMu.Unlock()
 }
 
 func (c *Client) unregisterSubscription(consumerID uint32) {
 	c.subs.Delete(consumerID)
+	c.subFilterMu.Lock()
+	delete(c.subFilters, consumerID)
+	c.subFilterMu.Unlock()
 }
 
 func bytesArr(b []byte) []int {

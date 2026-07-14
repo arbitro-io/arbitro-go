@@ -79,13 +79,13 @@ func (b *CronBuilder) Run(ctx context.Context, handler CronHandler) (*CronHandle
 	}
 	timeoutMs := uint32(timeout.Milliseconds())
 
-	seq := b.client.conn.NextSeq()
+	seq := b.client.getConn().NextSeq()
 	frame, err := proto.EncodeCreateCron(seq, []byte(b.name), b.expr, b.tz, timeoutMs, b.overlap)
 	if err != nil {
 		return nil, err
 	}
 
-	reply, err := b.client.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := b.client.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +108,10 @@ func (b *CronBuilder) Run(ctx context.Context, handler CronHandler) (*CronHandle
 		b.client.crons = make(map[string]*cronEntry)
 	}
 	b.client.crons[b.name] = &cronEntry{
+		name:    b.name,
+		expr:    b.expr,
+		tz:      b.tz,
+		overlap: b.overlap,
 		handler: handler,
 		timeout: timeout,
 		handle:  handle,
@@ -134,12 +138,12 @@ func (h *CronHandle) Stop(ctx context.Context) error {
 	h.client.cronMu.Unlock()
 
 	// Send DeleteCron to broker
-	seq := h.client.conn.NextSeq()
+	seq := h.client.getConn().NextSeq()
 	frame, err := proto.EncodeDeleteCron(seq, []byte(h.name))
 	if err != nil {
 		return err
 	}
-	reply, err := h.client.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := h.client.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}
@@ -149,6 +153,14 @@ func (h *CronHandle) Stop(ctx context.Context) error {
 // --- internal ---
 
 type cronEntry struct {
+	// name/expr/tz/overlap are retained (in addition to the CronBuilder that
+	// created them) so the reconnect supervisor can replay EncodeCreateCron
+	// against a freshly redialed connection (G02 cron replay).
+	name    string
+	expr    string
+	tz      string
+	overlap bool
+
 	handler CronHandler
 	timeout time.Duration
 	handle  *CronHandle
@@ -216,10 +228,10 @@ func (c *Client) runCronHandler(entry *cronEntry, name string, fireTimeMs, fireC
 		ackOK = false
 	}
 
-	ackSeq := c.conn.NextSeq()
+	ackSeq := c.getConn().NextSeq()
 	ackFrame, ackErr := proto.EncodeCronAck(ackSeq, []byte(name), ackOK)
 	if ackErr == nil {
-		_ = c.conn.Send(ackFrame)
+		_ = c.getConn().Send(ackFrame)
 	}
 }
 

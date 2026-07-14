@@ -2,7 +2,6 @@ package conn
 
 import (
 	"context"
-	"math"
 	"math/rand"
 	"time"
 )
@@ -32,6 +31,7 @@ type ReconnectLoop struct {
 	connCfg      Config
 	onReconnect  func(*Connection)
 	onDisconnect func(error)
+	prevDelay    time.Duration
 }
 
 // NewReconnectLoop creates a new reconnection manager.
@@ -83,21 +83,44 @@ func (r *ReconnectLoop) Run(ctx context.Context) (*Connection, error) {
 	return nil, lastErr
 }
 
-// backoff calculates the delay for a given attempt with exponential backoff + jitter.
+// backoff calculates the delay for a given attempt using decorrelated
+// jitter (AWS architecture blog / Rust conn/reconnect.rs Backoff):
+//
+//	next = min(cap, random_between(base, prev*3))
+//
+// This spreads out reconnect storms better than plain exponential backoff
+// when many clients disconnect from the same broker simultaneously.
 func (r *ReconnectLoop) backoff(attempt int) time.Duration {
 	if attempt == 0 {
+		r.prevDelay = 0
 		return 0
 	}
 
-	// Exponential: base * 2^attempt
-	delay := float64(r.cfg.BaseDelay) * math.Pow(2, float64(attempt-1))
-	if delay > float64(r.cfg.MaxDelay) {
-		delay = float64(r.cfg.MaxDelay)
+	base := r.cfg.BaseDelay
+	if base <= 0 {
+		base = time.Millisecond
+	}
+	maxDelay := r.cfg.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = base
 	}
 
-	// Add jitter: ±25%
-	jitter := delay * 0.25 * (rand.Float64()*2 - 1)
-	delay += jitter
+	prev := r.prevDelay
+	if prev < base {
+		prev = base
+	}
 
-	return time.Duration(delay)
+	upper := prev * 3
+	if upper <= base {
+		upper = base + 1
+	}
+
+	span := upper - base
+	delay := base + time.Duration(rand.Int63n(int64(span)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	r.prevDelay = delay
+	return delay
 }

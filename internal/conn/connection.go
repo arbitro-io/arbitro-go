@@ -39,12 +39,26 @@ type Connection struct {
 	closed atomic.Bool
 	done   chan struct{}
 	timeout time.Duration
+
+	// Heartbeat / dead-connection watchdog (G09). lastPongMs is stamped on
+	// every inbound Pong (and initialized at Dial time so a broker that
+	// never responds is still caught after keepAliveTimeout).
+	lastPongMs        atomic.Int64
+	keepAliveInterval time.Duration
+	keepAliveTimeout  time.Duration
 }
 
 // Config holds connection parameters.
 type Config struct {
 	Addr    string
 	Timeout time.Duration
+
+	// KeepAliveInterval is how often a Ping is sent while idle. <= 0 disables
+	// the heartbeat goroutine.
+	KeepAliveInterval time.Duration
+	// KeepAliveTimeout is how long to wait without a Pong before the
+	// connection is declared dead and closed.
+	KeepAliveTimeout time.Duration
 }
 
 // Dial creates a new connection to the broker.
@@ -56,14 +70,20 @@ func Dial(ctx context.Context, cfg Config) (*Connection, error) {
 	}
 
 	c := &Connection{
-		addr:    cfg.Addr,
-		conn:    conn,
-		pending: NewPendingMap(),
-		writeCh: make(chan []byte, writeQueueCap),
-		done:    make(chan struct{}),
-		timeout: cfg.Timeout,
+		addr:              cfg.Addr,
+		conn:              conn,
+		pending:           NewPendingMap(),
+		writeCh:           make(chan []byte, writeQueueCap),
+		done:              make(chan struct{}),
+		timeout:           cfg.Timeout,
+		keepAliveInterval: cfg.KeepAliveInterval,
+		keepAliveTimeout:  cfg.KeepAliveTimeout,
 	}
 	c.seq.Store(1)
+	// Initialize the watchdog clock at connect time so a broker that never
+	// sends a Pong is still caught after keepAliveTimeout (matches Rust's
+	// last_pong_ns initialization in conn/heartbeat.rs).
+	c.lastPongMs.Store(time.Now().UnixMilli())
 
 	// Send handshake (direct write before writer goroutine starts)
 	if err := c.sendHello(); err != nil {
@@ -80,7 +100,41 @@ func Dial(ctx context.Context, cfg Config) (*Connection, error) {
 	// Start read loop
 	go c.readLoop()
 
+	// Start heartbeat goroutine (Ping every interval, watchdog on Pong
+	// staleness). Stopped implicitly when c.done is closed by Close()/
+	// readLoop(). Disabled when KeepAliveInterval <= 0.
+	if c.keepAliveInterval > 0 {
+		go c.heartbeatLoop()
+	}
+
 	return c, nil
+}
+
+// heartbeatLoop sends a Ping every keepAliveInterval and declares the
+// connection dead (closing it) if no Pong has been observed for
+// keepAliveTimeout. Mirrors conn/heartbeat.rs:35-77 in the Rust client.
+func (c *Connection) heartbeatLoop() {
+	ticker := time.NewTicker(c.keepAliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			last := c.lastPongMs.Load()
+			staleness := time.Now().UnixMilli() - last
+			if c.keepAliveTimeout > 0 && staleness > c.keepAliveTimeout.Milliseconds() {
+				// Dead connection — close it. This feeds the reconnect
+				// supervisor via Done().
+				_ = c.Close()
+				return
+			}
+			seq := c.NextSeq()
+			frame := proto.EncodePing(seq)
+			_ = c.Send(frame)
+		}
+	}
 }
 
 // NextSeq returns the next monotonically increasing sequence number.
@@ -251,7 +305,8 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 		}
 
 	case proto.ActionPong:
-		// Heartbeat response — no action needed
+		// Heartbeat response — stamp the watchdog clock (G09).
+		c.lastPongMs.Store(time.Now().UnixMilli())
 
 	case proto.ActionCronFire:
 		// Cron fire: broker-initiated push, not correlated to any pending

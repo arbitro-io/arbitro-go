@@ -8,7 +8,7 @@ import (
 
 // CreateStream creates a new stream on the broker.
 func (c *Client) CreateStream(ctx context.Context, name string, cfg StreamConfig) (*Stream, error) {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeCreateStream(
 		seq, []byte(name), []byte(cfg.SubjectFilter),
 		cfg.MaxMsgs, cfg.MaxBytes, uint64(cfg.MaxAge.Seconds()),
@@ -18,7 +18,7 @@ func (c *Client) CreateStream(ctx context.Context, name string, cfg StreamConfig
 	if err != nil {
 		return nil, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -54,12 +54,12 @@ func (c *Client) DeleteStream(ctx context.Context, name string, opts ...DeleteSt
 	for _, fn := range opts {
 		fn(&do)
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeDeleteStream(seq, []byte(name), !do.keepData)
 	if err != nil {
 		return err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}
@@ -68,12 +68,12 @@ func (c *Client) DeleteStream(ctx context.Context, name string, opts ...DeleteSt
 
 // StreamInfo returns metadata about a stream.
 func (c *Client) StreamInfo(ctx context.Context, name string) (*StreamInfo, error) {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeGetStream(seq, []byte(name))
 	if err != nil {
 		return nil, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -99,12 +99,12 @@ func (c *Client) ListStreams(ctx context.Context) ([]StreamInfo, error) {
 	const pageLimit uint32 = 1000
 	var out []StreamInfo
 	for offset := uint32(0); ; {
-		seq := c.conn.NextSeq()
+		seq := c.getConn().NextSeq()
 		frame, err := proto.EncodeListStreams(seq, offset, pageLimit)
 		if err != nil {
 			return nil, err
 		}
-		reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+		reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 		if err != nil {
 			return nil, err
 		}
@@ -144,12 +144,12 @@ func (c *Client) StreamExists(ctx context.Context, name string) (bool, error) {
 
 // PurgeStream deletes all messages in a stream. Returns message count purged.
 func (c *Client) PurgeStream(ctx context.Context, name string) (uint64, error) {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodePurgeStream(seq, []byte(name))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -165,12 +165,12 @@ func (c *Client) PurgeStream(ctx context.Context, name string) (uint64, error) {
 
 // DrainSubject deletes all messages matching a subject pattern.
 func (c *Client) DrainSubject(ctx context.Context, stream, subject string) (uint64, error) {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeDrainSubject(seq, []byte(stream), []byte(subject))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -186,12 +186,12 @@ func (c *Client) DrainSubject(ctx context.Context, stream, subject string) (uint
 
 // DeleteMessage tombstones a single message by sequence number.
 func (c *Client) DeleteMessage(ctx context.Context, stream string, msgSeq uint64) (bool, error) {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeDeleteMessage(seq, []byte(stream), msgSeq)
 	if err != nil {
 		return false, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return false, err
 	}
@@ -222,12 +222,12 @@ func (c *Client) DeleteConsumer(ctx context.Context, stream, name string) error 
 	if err != nil {
 		return err
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeDeleteConsumer(seq, consumerID)
 	if err != nil {
 		return err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}
@@ -240,12 +240,12 @@ func (c *Client) GetPending(ctx context.Context, stream, name string) (uint64, e
 	if err != nil {
 		return 0, err
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeGetConsumer(seq, streamID, []byte(name))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -262,12 +262,12 @@ func (c *Client) ConsumerInfo(ctx context.Context, stream, name string) (*Consum
 	if err != nil {
 		return nil, err
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeGetConsumer(seq, streamID, []byte(name))
 	if err != nil {
 		return nil, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -296,12 +296,12 @@ func (c *Client) ListConsumers(ctx context.Context, stream string) ([]ConsumerIn
 	const pageLimit uint32 = 1000
 	var out []ConsumerInfo
 	for offset := uint32(0); ; {
-		seq := c.conn.NextSeq()
+		seq := c.getConn().NextSeq()
 		frame, err := proto.EncodeListConsumers(seq, streamID, offset, pageLimit)
 		if err != nil {
 			return nil, err
 		}
-		reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+		reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 		if err != nil {
 			return nil, err
 		}
@@ -335,12 +335,12 @@ func (c *Client) PauseConsumer(ctx context.Context, stream, name string) error {
 	if err != nil {
 		return err
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodePauseConsumer(seq, streamID, []byte(name))
 	if err != nil {
 		return err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}
@@ -353,12 +353,12 @@ func (c *Client) ResumeConsumer(ctx context.Context, stream, name string) error 
 	if err != nil {
 		return err
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeResumeConsumer(seq, streamID, []byte(name))
 	if err != nil {
 		return err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}

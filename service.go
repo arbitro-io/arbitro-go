@@ -122,7 +122,7 @@ func (s *Service) Request(ctx context.Context, target, method string, payload []
 	binary.LittleEndian.PutUint32(replyTo[1:5], s.streamID)
 	copy(replyTo[5:], replySubject)
 
-	seq := s.client.conn.NextSeq()
+	seq := s.client.getConn().NextSeq()
 	frame := proto.EncodePublishWithReply(seq, targetStreamID, subject, replyTo, nil, payload, proto.FlagAckReq)
 
 	ch := make(chan []byte, 1)
@@ -132,7 +132,7 @@ func (s *Service) Request(ctx context.Context, target, method string, payload []
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	_, err = s.client.conn.SendExpectReply(tctx, frame, seq)
+	_, err = s.client.getConn().SendExpectReply(tctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -152,9 +152,9 @@ func (s *Service) Send(ctx context.Context, target, method string, payload []byt
 		return err
 	}
 	subject := []byte(svcPrefix + target + methodInfix + method)
-	seq := s.client.conn.NextSeq()
+	seq := s.client.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, targetStreamID, subject, nil, payload, proto.FlagAckReq)
-	return s.client.conn.Send(frame)
+	return s.client.getConn().Send(frame)
 }
 
 // Close shuts down the service and cancels pending requests.
@@ -231,12 +231,12 @@ func (s *Service) resolveStream(ctx context.Context, target string) (uint32, err
 		return val.(uint32), nil
 	}
 	streamName := "_svc-" + target
-	seq := s.client.conn.NextSeq()
+	seq := s.client.getConn().NextSeq()
 	frame, err := proto.EncodeGetStream(seq, []byte(streamName))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := s.client.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := s.client.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -273,12 +273,12 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	streamFilter := svcPrefix + b.name + ".>"
 
 	// Create stream
-	seq := b.client.conn.NextSeq()
+	seq := b.client.getConn().NextSeq()
 	frame, err := proto.EncodeCreateStream(seq, []byte(streamName), []byte(streamFilter), 0, 0, 3600, 1, 0, 0, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("service encode create stream: %w", err)
 	}
-	reply, err := b.client.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := b.client.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, fmt.Errorf("service create stream: %w", err)
 	}
@@ -317,7 +317,7 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	workerFilter := svcPrefix + b.name + methodInfix + ">"
 	workerName := "_svc-" + b.name + "-worker"
 
-	seq = b.client.conn.NextSeq()
+	seq = b.client.getConn().NextSeq()
 	frame, err = proto.EncodeCreateConsumer(
 		seq, streamID,
 		[]byte(workerName), []byte(workerName), []byte(workerFilter),
@@ -327,7 +327,7 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("service create worker consumer: %w", err)
 	}
-	reply, err = b.client.conn.SendExpectReply(ctx, frame, seq)
+	reply, err = b.client.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +353,7 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	replyFilter := svcPrefix + b.name + replyInfix + strconv.FormatUint(uint64(svc.instanceID), 10) + ".>"
 	replyName := "_svc-" + b.name + "-reply-" + strconv.FormatUint(uint64(svc.instanceID), 10)
 
-	seq = b.client.conn.NextSeq()
+	seq = b.client.getConn().NextSeq()
 	frame, err = proto.EncodeCreateConsumer(
 		seq, streamID,
 		[]byte(replyName), nil, []byte(replyFilter),
@@ -363,7 +363,7 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("service create reply consumer: %w", err)
 	}
-	reply, err = b.client.conn.SendExpectReply(ctx, frame, seq)
+	reply, err = b.client.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -392,15 +392,15 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 			handler:    svc.dispatch,
 			closed:     make(chan struct{}),
 		}
-		b.client.registerSubscription(entry.cid, sub)
+		b.client.registerSubscription(entry.cid, sub, [][]byte{[]byte(entry.filter)})
 		b.client.activeSubs.Add(1)
 
-		seq = b.client.conn.NextSeq()
+		seq = b.client.getConn().NextSeq()
 		subFrame, err := proto.EncodeSubscribe(seq, entry.cid, [][]byte{[]byte(entry.filter)})
 		if err != nil {
 			return nil, err
 		}
-		_, err = b.client.conn.SendExpectReply(ctx, subFrame, seq)
+		_, err = b.client.getConn().SendExpectReply(ctx, subFrame, seq)
 		if err != nil {
 			return nil, err
 		}

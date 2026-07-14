@@ -30,12 +30,26 @@ import (
 
 // Client is the main handle to the Arbitro broker.
 type Client struct {
-	conn    *conn.Connection
-	opts    clientOptions
-	streams streamCache
+	// connPtr holds the current live Connection. It is swapped out by the
+	// reconnect supervisor (G02) whenever the underlying TCP connection is
+	// replaced, so callers must always go through getConn() rather than
+	// caching the pointer across a network round trip.
+	connPtr atomic.Pointer[conn.Connection]
+
+	addr      string
+	opts      clientOptions
+	dialCfg   conn.Config
+	reconnCfg conn.ReconnectConfig
+	streams   streamCache
 
 	// Subscription dispatch: consumer_id → subscription
-	subs   sync.Map // map[uint32]*Subscription
+	subs sync.Map // map[uint32]*Subscription
+
+	// subFilters stores the Subscribe filters per consumer_id so the
+	// reconnect supervisor can replay them against a freshly (re)dialed
+	// connection. Guarded by subFilterMu.
+	subFilterMu sync.Mutex
+	subFilters  map[uint32][][]byte
 
 	// Cron registry
 	cronMu sync.Mutex
@@ -52,6 +66,17 @@ type Client struct {
 	nacksSent      atomic.Uint64
 	reconnects     atomic.Uint64
 	activeSubs     atomic.Uint64
+
+	// Reconnect / lifecycle state.
+	closing atomic.Bool // Close() was called by the user — supervisor exits quietly.
+	dead    atomic.Bool // terminal reconnect failure — client is unusable.
+
+	// reconnectMu/reconnectGate implement the "wait, bounded by dial timeout"
+	// policy for concurrent Sends while a reconnect is in flight (see G02
+	// item 4). getConn() blocks on reconnectGate (if non-nil) up to
+	// opts.timeout before returning the current connection pointer.
+	reconnectMu   sync.RWMutex
+	reconnectGate chan struct{}
 }
 
 // Connect establishes a connection to the Arbitro broker.
@@ -61,21 +86,34 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		fn(&o)
 	}
 
-	c, err := conn.Dial(ctx, conn.Config{
-		Addr:    addr,
-		Timeout: o.timeout,
-	})
+	dialCfg := conn.Config{
+		Addr:              addr,
+		Timeout:           o.timeout,
+		KeepAliveInterval: o.keepAlive.Interval,
+		KeepAliveTimeout:  o.keepAlive.Timeout,
+	}
+
+	c, err := conn.Dial(ctx, dialCfg)
 	if err != nil {
 		return nil, err
 	}
 
 	client := &Client{
-		conn: c,
-		opts: o,
+		addr:    addr,
+		opts:    o,
+		dialCfg: dialCfg,
+		reconnCfg: conn.ReconnectConfig{
+			Enabled:    o.reconnect,
+			MaxRetries: o.maxRetries,
+			BaseDelay:  o.retryInterval,
+			MaxDelay:   30 * time.Second,
+		},
 		streams: streamCache{
 			cache: make(map[string]uint32),
 		},
+		subFilters: make(map[uint32][][]byte),
 	}
+	client.connPtr.Store(c)
 
 	// Wire up deliver dispatch
 	c.SetDeliverHandler(client.handleDeliver)
@@ -83,12 +121,46 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 	// Wire up cron fire dispatch
 	c.SetCronFireHandler(client.dispatchCronFire)
 
+	// Start the reconnect supervisor (G02). It watches the active
+	// connection's Done() channel and, on unexpected disconnect, runs the
+	// decorrelated-jitter backoff loop to re-dial, re-handshake, resubscribe,
+	// and replay crons.
+	go client.superviseConnection(c)
+
 	return client, nil
 }
 
-// Close gracefully shuts down the client connection.
+// getConn returns the current live connection. If a reconnect is in
+// progress, it blocks (up to the configured dial timeout) so that concurrent
+// Sends either observe the freshly reconnected connection or fall through to
+// the stale one (whose Send() will fail with a clear "connection closed"
+// error) rather than racing a half-swapped pointer. This is the documented
+// choice for G02 item 4: wait, bounded by dialTimeout, rather than returning
+// an immediate ErrReconnecting.
+func (c *Client) getConn() *conn.Connection {
+	c.reconnectMu.RLock()
+	gate := c.reconnectGate
+	c.reconnectMu.RUnlock()
+
+	if gate != nil {
+		wait := c.opts.timeout
+		if wait <= 0 {
+			wait = 5 * time.Second
+		}
+		select {
+		case <-gate:
+		case <-time.After(wait):
+		}
+	}
+
+	return c.connPtr.Load()
+}
+
+// Close gracefully shuts down the client connection and stops the reconnect
+// supervisor from restarting it.
 func (c *Client) Close() error {
-	return c.conn.Close()
+	c.closing.Store(true)
+	return c.getConn().Close()
 }
 
 // Metrics returns a point-in-time snapshot of client counters.
@@ -99,9 +171,9 @@ func (c *Client) Metrics() MetricsSnapshot {
 		AcksSent:        c.acksSent.Load(),
 		NacksSent:       c.nacksSent.Load(),
 		Reconnects:      c.reconnects.Load(),
-		PendingRequests: uint64(c.conn.PendingLen()),
+		PendingRequests: uint64(c.getConn().PendingLen()),
 		ActiveSubs:      c.activeSubs.Load(),
-		BatchFramesRecv: c.conn.BatchRecv.Load(),
+		BatchFramesRecv: c.getConn().BatchRecv.Load(),
 	}
 }
 
@@ -118,10 +190,10 @@ func (c *Client) Publish(ctx context.Context, stream, subject string, payload []
 	}
 
 	subj := c.prefixed(subject)
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subj), []byte(po.msgID), payload, proto.FlagAckReq)
 
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}
@@ -140,18 +212,18 @@ func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...Pu
 
 	streamID, _ := c.streams.get(stream)
 	subj := c.prefixed(subject)
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subj), []byte(po.msgID), payload, proto.FlagNone)
-	_ = c.conn.Send(frame)
+	_ = c.getConn().Send(frame)
 	c.publishesSent.Add(1)
 }
 
 // PublishFireAndForget is the fastest publish path — uses a pre-resolved stream ID,
 // no options parsing, no string conversion overhead. Equivalent to Rust's publish().
 func (c *Client) PublishFireAndForget(streamID uint32, subject string, payload []byte) error {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subject), nil, payload, proto.FlagNone)
-	err := c.conn.Send(frame)
+	err := c.getConn().Send(frame)
 	if err == nil {
 		c.publishesSent.Add(1)
 	}
@@ -192,9 +264,9 @@ func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
 		if end > len(protoEntries) {
 			end = len(protoEntries)
 		}
-		seq := c.conn.NextSeq()
+		seq := c.getConn().NextSeq()
 		frame := proto.EncodePublishBatch(seq, streamID, protoEntries[start:end], proto.FlagNone)
-		_ = c.conn.Send(frame)
+		_ = c.getConn().Send(frame)
 	}
 	c.publishesSent.Add(1)
 }
@@ -219,10 +291,10 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 	if firstEnd > len(protoEntries) {
 		firstEnd = len(protoEntries)
 	}
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublishBatch(seq, streamID, protoEntries[:firstEnd], proto.FlagAckReq)
 
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -242,9 +314,9 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 		if end > len(protoEntries) {
 			end = len(protoEntries)
 		}
-		s := c.conn.NextSeq()
+		s := c.getConn().NextSeq()
 		f := proto.EncodePublishBatch(s, streamID, protoEntries[start:end], proto.FlagNone)
-		if err := c.conn.Send(f); err != nil {
+		if err := c.getConn().Send(f); err != nil {
 			return firstSeq, err
 		}
 	}
@@ -260,10 +332,10 @@ func (c *Client) PublishDelayed(ctx context.Context, stream, subject string, pay
 	}
 
 	subj := c.prefixed(subject)
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublishDelayed(seq, streamID, []byte(subj), payload, uint64(delay.Milliseconds()), proto.FlagAckReq)
 
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return err
 	}
@@ -289,7 +361,7 @@ func (c *Client) Request(ctx context.Context, stream, subject string, payload []
 	binary.LittleEndian.PutUint32(replyTo[1:5], streamID)
 	copy(replyTo[5:], replySubject)
 
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublishWithReply(seq, streamID, []byte(subj), replyTo, nil, payload, proto.FlagAckReq)
 
 	ch := make(chan []byte, 1)
@@ -299,7 +371,7 @@ func (c *Client) Request(ctx context.Context, stream, subject string, payload []
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	_, err = c.conn.SendExpectReply(tctx, frame, seq)
+	_, err = c.getConn().SendExpectReply(tctx, frame, seq)
 	if err != nil {
 		return nil, err
 	}
@@ -348,12 +420,12 @@ func (c *Client) resolveStreamID(ctx context.Context, name string) (uint32, erro
 		return id, nil
 	}
 	// GetStream to resolve the ID
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeGetStream(seq, []byte(name))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -370,12 +442,12 @@ func (c *Client) resolveStreamID(ctx context.Context, name string) (uint32, erro
 }
 
 func (c *Client) resolveConsumerID(ctx context.Context, streamID uint32, name string) (uint32, error) {
-	seq := c.conn.NextSeq()
+	seq := c.getConn().NextSeq()
 	frame, err := proto.EncodeGetConsumer(seq, streamID, []byte(name))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.conn.SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return 0, err
 	}
@@ -525,3 +597,149 @@ func (c *Client) deliverToSub(sub *Subscription, msg *Msg) {
 	}
 }
 
+
+// --- reconnect supervisor (G02) ---
+//
+// superviseConnection watches the currently active Connection's Done()
+// channel. When it fires (dead-connection watchdog closed it, the reader hit
+// EOF, or the peer reset the socket), the supervisor either:
+//   - exits quietly if the client was closed by the user (c.closing), or
+//   - if reconnect is disabled, marks the client permanently dead and fails
+//     every outstanding subscription/request, or
+//   - runs the decorrelated-jitter reconnect loop; on success it keeps
+//     watching the new connection, on terminal failure (max retries
+//     exhausted) it marks the client dead and fails everything outstanding.
+func (c *Client) superviseConnection(cur *conn.Connection) {
+	for {
+		<-cur.Done()
+
+		if c.closing.Load() {
+			return
+		}
+
+		if !c.opts.reconnect {
+			c.dead.Store(true)
+			c.failAllPending(fmt.Errorf("arbitro: connection closed and reconnect is disabled"))
+			return
+		}
+
+		newConn, err := c.doReconnect()
+		if err != nil {
+			c.dead.Store(true)
+			c.failAllPending(fmt.Errorf("arbitro: reconnect failed permanently: %w", err))
+			return
+		}
+
+		cur = newConn
+	}
+}
+
+// doReconnect runs the backoff/redial loop, wires up the new connection's
+// dispatch handlers, swaps it into connPtr, replays subscriptions and crons,
+// and bumps the reconnects metric. While in flight, getConn() callers block
+// (bounded by opts.timeout) on reconnectGate rather than observing a
+// half-swapped connection.
+func (c *Client) doReconnect() (*conn.Connection, error) {
+	gate := make(chan struct{})
+	c.reconnectMu.Lock()
+	c.reconnectGate = gate
+	c.reconnectMu.Unlock()
+	defer func() {
+		c.reconnectMu.Lock()
+		c.reconnectGate = nil
+		c.reconnectMu.Unlock()
+		close(gate)
+	}()
+
+	loop := conn.NewReconnectLoop(c.dialCfg, c.reconnCfg)
+	newConn, err := loop.Run(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	newConn.SetDeliverHandler(c.handleDeliver)
+	newConn.SetCronFireHandler(c.dispatchCronFire)
+
+	c.connPtr.Store(newConn)
+	c.reconnects.Add(1)
+
+	c.replaySubscriptions(newConn)
+	c.replayCrons(newConn)
+
+	return newConn, nil
+}
+
+// replaySubscriptions re-sends a Subscribe frame for every consumer_id that
+// was registered before the disconnect. Mirrors the Rust supervisor's
+// replay_subscriptions (conn/session.rs), using the stored filters keyed by
+// consumer_id rather than re-running CreateConsumer -- the consumer itself is
+// expected to still exist server-side (durable by name/group).
+func (c *Client) replaySubscriptions(newConn *conn.Connection) {
+	c.subFilterMu.Lock()
+	snapshot := make(map[uint32][][]byte, len(c.subFilters))
+	for cid, filters := range c.subFilters {
+		snapshot[cid] = filters
+	}
+	c.subFilterMu.Unlock()
+
+	timeout := c.opts.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for consumerID, filters := range snapshot {
+		seq := newConn.NextSeq()
+		frame, err := proto.EncodeSubscribe(seq, consumerID, filters)
+		if err != nil {
+			continue
+		}
+		// Best-effort: if the broker rejects the resubscribe (e.g. the
+		// consumer no longer exists), the subscription's channel simply
+		// stops receiving further deliveries; the caller can detect this
+		// via a lack of messages and re-subscribe explicitly.
+		_, _ = newConn.SendExpectReply(ctx, frame, seq)
+	}
+}
+
+// replayCrons re-registers every cron this client owns against the new
+// connection, mirroring the Rust supervisor's cron::replay_crons.
+func (c *Client) replayCrons(newConn *conn.Connection) {
+	c.cronMu.Lock()
+	entries := make([]*cronEntry, 0, len(c.crons))
+	for _, e := range c.crons {
+		entries = append(entries, e)
+	}
+	c.cronMu.Unlock()
+
+	timeout := c.opts.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for _, e := range entries {
+		if e.name == "" {
+			continue
+		}
+		seq := newConn.NextSeq()
+		frame, err := proto.EncodeCreateCron(seq, []byte(e.name), e.expr, e.tz, uint32(e.timeout.Milliseconds()), e.overlap)
+		if err != nil {
+			continue
+		}
+		_, _ = newConn.SendExpectReply(ctx, frame, seq)
+	}
+}
+
+// failAllPending is invoked on terminal reconnect failure (or when reconnect
+// is disabled). It closes every subscription's delivery channel so callers
+// don't block forever on a client that will never recover.
+func (c *Client) failAllPending(_ error) {
+	c.subs.Range(func(key, value any) bool {
+		sub := value.(*Subscription)
+		sub.closeLocal()
+		return true
+	})
+}
