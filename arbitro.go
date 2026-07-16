@@ -342,6 +342,15 @@ func (c *Client) Publish(ctx context.Context, stream, subject string, payload []
 	return nil
 }
 
+// PublishWait sends a message and waits for the broker OK (RepOk) — a
+// name-parity alias for the Rust reference client's publish_wait. It waits for
+// the broker acknowledgement, NOT a disk fsync. Identical to Publish; provided
+// so code ported from the Rust/other clients can use the same method name. Use
+// PublishAsync / PublishFireAndForget for fire-and-forget.
+func (c *Client) PublishWait(ctx context.Context, stream, subject string, payload []byte, opts ...PublishOption) error {
+	return c.Publish(ctx, stream, subject, payload, opts...)
+}
+
 // PublishAsync sends a message without waiting for confirmation (fire-and-forget).
 // Uses the write channel — no mutex, no syscall on the calling goroutine.
 func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...PublishOption) {
