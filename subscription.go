@@ -6,8 +6,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbitro-io/arbitro-go/internal/ackstore"
 	"github.com/arbitro-io/arbitro-go/internal/proto"
 )
+
+// subChanCap is the buffer size of the Subscription delivery channel.
+// Matches the Rust client's mpsc::channel(4096) in state/subscriptions.rs —
+// small caps (previously 256) caused the reader goroutine to block on
+// deliverToSub whenever a consumer fell one batch behind, serializing acks
+// (Go-HP4 audit finding).
+const subChanCap = 4096
 
 // Subscription represents an active message subscription.
 type Subscription struct {
@@ -17,6 +25,7 @@ type Subscription struct {
 	handler    func(*Msg)
 	closed     chan struct{}
 	closeOnce  sync.Once
+	slot       ackstore.SlotRef // redelivery-dedup handle (nil if dedup disabled)
 }
 
 // Messages returns the delivery channel. Range over it for push-mode consumption.
@@ -85,6 +94,7 @@ type Msg struct {
 	payloadOff  int
 	payloadLen  int
 	client      *Client
+	slot        ackstore.SlotRef // dedup handle for this message's consumer (may be nil)
 	acked       bool
 }
 
@@ -142,7 +152,10 @@ func (m *Msg) Dup() bool {
 	return hdr.Flags&proto.FlagDup != 0
 }
 
-// Ack acknowledges the message (batched for throughput — flushed every 1ms or 64 acks).
+// Ack acknowledges the message (batched for throughput — flushed on drain).
+// Also records the seq in the redelivery-dedup store (G18) so a future
+// redelivery of this message is recognized and skipped. The store write is a
+// buffered append; a background goroutine flushes it durably.
 func (m *Msg) Ack() {
 	if m.acked {
 		return
@@ -150,6 +163,9 @@ func (m *Msg) Ack() {
 	m.acked = true
 	m.client.getConn().AckBatch.Ack(m.consumerID, m.subjectHash, m.seq)
 	m.client.acksSent.Add(1)
+	if m.slot != nil {
+		_ = m.slot.Record(m.seq)
+	}
 }
 
 // Nack negatively acknowledges — broker requeues immediately.
@@ -217,9 +233,23 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 	sub := &Subscription{
 		client:     c,
 		consumerID: consumerID,
-		ch:         make(chan *Msg, 256),
+		ch:         make(chan *Msg, subChanCap),
 		handler:    so.handler,
 		closed:     make(chan struct{}),
+	}
+
+	// Resolve the redelivery-dedup slot for this (stream, consumer) pair.
+	// Keyed by the DURABLE names — survives consumer delete+recreate. Nil if
+	// dedup is disabled. Errors here are non-fatal: dedup degrades to
+	// at-least-once rather than failing the subscribe.
+	if c.ackStore != nil {
+		consumerName := cfg.Name
+		if consumerName == "" {
+			consumerName = stream
+		}
+		if slot, serr := c.ackStore.Slot(c.prefixed(stream), consumerName); serr == nil {
+			sub.slot = slot
+		}
 	}
 
 	// Send Subscribe frame

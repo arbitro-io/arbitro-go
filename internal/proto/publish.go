@@ -2,15 +2,25 @@ package proto
 
 import "encoding/binary"
 
-// EncodePublish builds a full Publish frame (header + body).
-// Body layout: stream_id(4) + subject_len(2) + msg_id_len(2) + subject + msg_id + payload
-func EncodePublish(seq uint64, streamID uint32, subject, msgID, payload []byte, flags byte) []byte {
+// PublishWireSize returns the total frame size (header + body) for a Publish
+// frame with the given payload/subject/msg_id sizes. Cheap: pure arithmetic,
+// safe for hot-path sizing checks (stack buffer vs heap alloc branch).
+func PublishWireSize(subjectLen, msgIDLen, payloadLen int) int {
+	return HeaderSize + 8 + subjectLen + msgIDLen + payloadLen
+}
+
+// EncodePublishInto encodes a Publish frame directly into buf and returns the
+// number of bytes written. buf MUST have at least PublishWireSize(...) capacity;
+// no bounds check beyond a subslice — caller owns the buffer lifetime. Lets
+// the hot path allocate a stack scratch array and skip the heap when the
+// frame fits (mirrors Rust's WriteFrame::Inline for size ≤ INLINE_CAP).
+func EncodePublishInto(buf []byte, seq uint64, streamID uint32, subject, msgID, payload []byte, flags byte) int {
 	subjLen := len(subject)
 	msgIDLen := len(msgID)
 	bodyLen := 8 + subjLen + msgIDLen + len(payload)
+	total := HeaderSize + bodyLen
 
-	frame := make([]byte, HeaderSize+bodyLen)
-	EncodeHeader(frame, Header{
+	EncodeHeader(buf, Header{
 		Action:     ActionPublish,
 		Flags:      flags,
 		EntryFlags: EntryFlagNone,
@@ -18,7 +28,7 @@ func EncodePublish(seq uint64, streamID uint32, subject, msgID, payload []byte, 
 		Seq:        seq,
 	})
 
-	body := frame[HeaderSize:]
+	body := buf[HeaderSize:total]
 	binary.LittleEndian.PutUint32(body[0:4], streamID)
 	binary.LittleEndian.PutUint16(body[4:6], uint16(subjLen))
 	binary.LittleEndian.PutUint16(body[6:8], uint16(msgIDLen))
@@ -26,6 +36,16 @@ func EncodePublish(seq uint64, streamID uint32, subject, msgID, payload []byte, 
 	copy(body[8+subjLen:], msgID)
 	copy(body[8+subjLen+msgIDLen:], payload)
 
+	return total
+}
+
+// EncodePublish builds a full Publish frame (header + body). Convenience
+// wrapper that always heap-allocates — prefer EncodePublishInto with a
+// caller-owned buffer on the hot path.
+// Body layout: stream_id(4) + subject_len(2) + msg_id_len(2) + subject + msg_id + payload
+func EncodePublish(seq uint64, streamID uint32, subject, msgID, payload []byte, flags byte) []byte {
+	frame := make([]byte, PublishWireSize(len(subject), len(msgID), len(payload)))
+	EncodePublishInto(frame, seq, streamID, subject, msgID, payload, flags)
 	return frame
 }
 

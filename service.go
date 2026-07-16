@@ -388,7 +388,7 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 		sub := &Subscription{
 			client:     b.client,
 			consumerID: entry.cid,
-			ch:         make(chan *Msg, 256),
+			ch:         make(chan *Msg, subChanCap),
 			handler:    svc.dispatch,
 			closed:     make(chan struct{}),
 		}

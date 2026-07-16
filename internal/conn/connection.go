@@ -35,11 +35,24 @@ type Connection struct {
 	// never allocated here. Nil-safe: dispatch/ackbatcher no-op if unset.
 	AckRelay *ackrel.Relay
 
-	// Subscription dispatch: consumer_id → handler
-	onDeliver func(frame []byte) // raw frame dispatch (for subscription layer)
+	// Subscription dispatch. onDeliver handles single Deliver (0x0200) with
+	// the already-decoded header + full frame; onBatchDeliver handles
+	// RepBatch/FanoutBatch (0x0205/0x0207) with just the body slice (envelope
+	// header is not needed by the subscription layer). Split callbacks avoid
+	// the redundant DecodeHeader that used to happen in the client layer
+	// (Go-HP5 audit finding).
+	onDeliver      func(hdr proto.Header, frame []byte)
+	onBatchDeliver func(body []byte)
 
 	// Cron fire dispatch: raw frame dispatch (for cron layer)
 	onCronFire func(frame []byte)
+
+	// onAckConfirm fires when the broker reports its ack cursor for a
+	// consumer (AckBatchResp.new_cursor / AckStateRep.cursor). The client
+	// uses it to bulk-drop dedup entries ≤ cursor from the ackstore — the
+	// broker will never redeliver at or below it, so the automatic ack path
+	// keeps the dedup set tiny with no periodic job.
+	onAckConfirm func(consumerID uint32, cursor uint64)
 
 	// Diagnostics
 	BatchRecv atomic.Uint64
@@ -202,9 +215,19 @@ func (c *Connection) SendExpectReply(ctx context.Context, frame []byte, seq uint
 	}
 }
 
-// SetDeliverHandler sets the raw deliver dispatch function.
-func (c *Connection) SetDeliverHandler(fn func(frame []byte)) {
-	c.onDeliver = fn
+// SetDeliverHandler wires the subscription-layer dispatchers. single fires on
+// action 0x0200 with the pre-decoded header + full frame; batch fires on
+// 0x0205/0x0207 with the body slice only.
+func (c *Connection) SetDeliverHandler(single func(hdr proto.Header, frame []byte), batch func(body []byte)) {
+	c.onDeliver = single
+	c.onBatchDeliver = batch
+}
+
+// SetAckConfirmHandler wires the broker-cursor callback (AckBatchResp /
+// AckStateRep). Called with (consumer_id, cursor) so the client can drop
+// dedup entries ≤ cursor from its ackstore.
+func (c *Connection) SetAckConfirmHandler(fn func(consumerID uint32, cursor uint64)) {
+	c.onAckConfirm = fn
 }
 
 // SetCronFireHandler sets the raw CronFire dispatch function. Unlike
@@ -242,6 +265,12 @@ func (c *Connection) sendHello() error {
 	return err
 }
 
+// readLoop reads frames from the socket and dispatches them. Single alloc
+// per frame (down from 3 mallocs + 2 copies), header decoded in-place — same
+// shape as Rust reader's single BytesMut with split_to (transport/reader.rs).
+// The frame buffer may be retained by *Msg pointers (delivery) or the pending
+// map (RepOk/RepError), so we must allocate fresh; scratch reuse would race
+// with those consumers (Go-HP2 audit finding).
 func (c *Connection) readLoop() {
 	defer func() {
 		c.closed.Store(true)
@@ -256,49 +285,42 @@ func (c *Connection) readLoop() {
 	reader := bufio.NewReaderSize(c.conn, 65536)
 
 	for {
-		// Read 16-byte header (same size for both v2 Header and Envelope)
-		headerBuf := make([]byte, proto.HeaderSize)
-		if _, err := io.ReadFull(reader, headerBuf); err != nil {
+		// Peek 2 bytes to size the frame before allocating. bufio.Reader
+		// buffers reads; Peek is cheap and lets us do one alloc = total size,
+		// then one ReadFull for the whole frame — no intermediate buffers.
+		peek, err := reader.Peek(proto.HeaderSize)
+		if err != nil {
 			return
 		}
 
-		// Peek action to determine header format
-		action := binary.LittleEndian.Uint16(headerBuf[0:2])
+		action := binary.LittleEndian.Uint16(peek[0:2])
 
 		var hdr proto.Header
 		var msgLen uint32
 
 		if proto.IsEnvelopeAction(action) {
-			// Envelope format: msg_len at offset 8-11
-			env := proto.DecodeEnvelope(headerBuf)
+			env := proto.DecodeEnvelope(peek)
 			msgLen = env.MsgLen
-			// Convert to Header for dispatch compatibility
 			hdr = proto.Header{
 				Action: env.Action,
 				Flags:  env.Flags,
 				MsgLen: env.MsgLen,
 			}
 		} else {
-			hdr = proto.DecodeHeader(headerBuf)
+			hdr = proto.DecodeHeader(peek)
 			msgLen = hdr.MsgLen
 		}
 
-		// Read body
+		total := int(proto.HeaderSize) + int(msgLen)
+		frame := make([]byte, total)
+		if _, err := io.ReadFull(reader, frame); err != nil {
+			return
+		}
+
 		var body []byte
 		if msgLen > 0 {
-			body = make([]byte, msgLen)
-			if _, err := io.ReadFull(reader, body); err != nil {
-				return
-			}
+			body = frame[proto.HeaderSize:total]
 		}
-
-		// Build full frame for dispatch
-		frame := make([]byte, proto.HeaderSize+int(msgLen))
-		copy(frame, headerBuf)
-		if body != nil {
-			copy(frame[proto.HeaderSize:], body)
-		}
-
 		c.dispatch(hdr, frame, body)
 	}
 }
@@ -317,13 +339,13 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 
 	case proto.ActionDeliver:
 		if c.onDeliver != nil {
-			c.onDeliver(frame)
+			c.onDeliver(hdr, frame)
 		}
 
 	case proto.ActionRepBatch, proto.ActionFanoutBatch:
-		// Batch delivery: dispatch each entry
-		if c.onDeliver != nil {
-			c.dispatchBatch(frame, body)
+		if c.onBatchDeliver != nil {
+			c.BatchRecv.Add(1)
+			c.onBatchDeliver(body)
 		}
 
 	case proto.ActionPong:
@@ -370,6 +392,12 @@ func (c *Connection) handleAckStateRep(body []byte) {
 		// Below the broker's retention floor — will never be confirmable.
 		c.AckRelay.ConfirmUpTo(consumerID, lowSeq-1)
 	}
+	if c.onAckConfirm != nil {
+		c.onAckConfirm(consumerID, cursor)
+		if lowSeq > 0 {
+			c.onAckConfirm(consumerID, lowSeq-1)
+		}
+	}
 
 	seqs := c.AckRelay.PendingSeqs(consumerID)
 	for start := 0; start < len(seqs); start += proto.AckBatchMaxSeqs {
@@ -394,12 +422,14 @@ func (c *Connection) handleAckBatchResp(body []byte) {
 		return
 	}
 	c.AckRelay.ConfirmUpTo(consumerID, newCursor)
+	if c.onAckConfirm != nil {
+		c.onAckConfirm(consumerID, newCursor)
+	}
 }
 
 func (c *Connection) dispatchBatch(frame, body []byte) {
 	c.BatchRecv.Add(1)
-	// Pass the full frame (including envelope header) to the deliver handler
-	if c.onDeliver != nil {
-		c.onDeliver(frame)
+	if c.onBatchDeliver != nil {
+		c.onBatchDeliver(body)
 	}
 }

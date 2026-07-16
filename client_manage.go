@@ -31,7 +31,9 @@ func (c *Client) CreateStream(ctx context.Context, name string, cfg StreamConfig
 	}
 	streamID := uint32(proto.RepOkRefSeq(body))
 	c.streams.set(name, streamID)
-	return &Stream{client: c, name: name, streamID: streamID}, nil
+	s := c.Stream(name)
+	s.streamID.Store(streamID)
+	return s, nil
 }
 
 // UpsertStream creates or re-uses an existing stream with equivalent config.
@@ -43,7 +45,9 @@ func (c *Client) UpsertStream(ctx context.Context, name string, cfg StreamConfig
 		if err2 != nil {
 			return nil, err2
 		}
-		return &Stream{client: c, name: name, streamID: id}, nil
+		s := c.Stream(name)
+		s.streamID.Store(id)
+		return s, nil
 	}
 	return s, err
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/arbitro-io/arbitro-go/internal/ackrel"
+	"github.com/arbitro-io/arbitro-go/internal/ackstore"
 	"github.com/arbitro-io/arbitro-go/internal/conn"
 	"github.com/arbitro-io/arbitro-go/internal/proto"
 )
@@ -89,11 +91,16 @@ type Client struct {
 	reqSubs       map[uint32]*Subscription // map[streamID]*Subscription
 
 	// Ack-reliability hot tier (G01) — outlives any single Connection,
-	// re-attached to the new Connection after every reconnect. seenCache
-	// (G18) dedupes redeliveries so the user handler runs at most once per
-	// (consumer, seq).
-	ackRelay  *ackrel.Relay
-	seenCache *ackrel.SeenCache
+	// re-attached to the new Connection after every reconnect.
+	ackRelay *ackrel.Relay
+
+	// ackStore is the redelivery-dedup store keyed by (stream, consumer, seq).
+	// Default in-memory; WithAckPersistence swaps in a durable WAL. Nil when
+	// dedup is disabled. Outlives connections. A background goroutine flushes
+	// it (Sync) so recorded acks become durable without blocking the ack path.
+	ackStore     ackstore.Store
+	ackSyncStop  chan struct{}
+	ackSyncOnce  sync.Once
 
 	// metrics. AcksDeferred/AcksConfirmed/AcksExpired (G14) are NOT tracked
 	// here as separate atomics — they're sourced live from ackRelay
@@ -154,7 +161,25 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		},
 		subFilters: make(map[uint32][][]byte),
 	}
-	client.seenCache = ackrel.NewSeenCache()
+	// Redelivery dedup (G18) via the ackstore. Default: in-memory store keyed
+	// by (stream, consumer, seq). WithAckPersistence swaps in a durable WAL;
+	// WithoutAckDedup / ARBITRO_GO_DISABLE_SEEN=1 disables it entirely.
+	if o.ackStoreErr != nil {
+		return nil, o.ackStoreErr
+	}
+	if os.Getenv("ARBITRO_GO_DISABLE_SEEN") == "1" {
+		client.ackStore = nil
+	} else if o.ackDedup {
+		if o.ackStore != nil {
+			client.ackStore = o.ackStore
+		} else {
+			client.ackStore = ackstore.NewMemory(0)
+		}
+	}
+	if client.ackStore != nil {
+		client.ackSyncStop = make(chan struct{})
+		go client.ackSyncLoop()
+	}
 	client.ackRelay = ackrel.NewRelay(100*time.Millisecond, client.sendAckBatch)
 	// Deferred acks older than 60s without broker confirmation are dropped
 	// (surfaced via the AcksExpired metric, G14) rather than retried
@@ -165,8 +190,13 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 	client.connPtr.Store(c)
 	c.AckRelay = client.ackRelay
 
-	// Wire up deliver dispatch
-	c.SetDeliverHandler(client.handleDeliver)
+	// Wire up deliver dispatch — split single vs batch to avoid a redundant
+	// DecodeHeader in the client layer (HP5+HP8).
+	c.SetDeliverHandler(client.dispatchSingleDeliver, client.dispatchBatchDeliver)
+
+	// Wire the broker-cursor callback so AckBatchResp/AckStateRep bulk-clean
+	// the ackstore (drop dedup entries ≤ cursor) — automatic, no periodic job.
+	c.SetAckConfirmHandler(client.confirmAckStoreUpTo)
 
 	// Wire up cron fire dispatch
 	c.SetCronFireHandler(client.dispatchCronFire)
@@ -213,7 +243,28 @@ func (c *Client) Close() error {
 	if c.ackRelay != nil {
 		c.ackRelay.Close()
 	}
+	if c.ackStore != nil {
+		c.ackSyncOnce.Do(func() { close(c.ackSyncStop) })
+		_ = c.ackStore.Sync()  // final flush of recorded acks
+		_ = c.ackStore.Close() // WAL fsync + close; no-op for memory
+	}
 	return c.getConn().Close()
+}
+
+// ackSyncLoop periodically flushes the ackstore so recorded acks become
+// durable without blocking the delivery/ack hot path. Cadence matches the
+// ack-relay sweep (100ms). Cheap no-op for the in-memory store.
+func (c *Client) ackSyncLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ackSyncStop:
+			return
+		case <-ticker.C:
+			_ = c.ackStore.Sync()
+		}
+	}
 }
 
 // sendAckBatch transmits an AckBatch frame for the given consumer/generation/
@@ -597,7 +648,7 @@ func (c *Client) ensureReqReplySub(ctx context.Context, streamID uint32, stream 
 	sub := &Subscription{
 		client:     c,
 		consumerID: consumerID,
-		ch:         make(chan *Msg, 256),
+		ch:         make(chan *Msg, subChanCap),
 		handler:    c.handleRequestReply,
 		closed:     make(chan struct{}),
 	}
@@ -721,22 +772,7 @@ func (c *Client) resolveConsumerID(ctx context.Context, streamID uint32, name st
 	return uint32(proto.RepOkRefSeq(body)), nil
 }
 
-func (c *Client) handleDeliver(frame []byte) {
-	if len(frame) < proto.HeaderSize {
-		return
-	}
-
-	hdr := proto.DecodeHeader(frame)
-
-	switch hdr.Action {
-	case proto.ActionDeliver:
-		c.dispatchSingleDeliver(frame, hdr)
-	case proto.ActionRepBatch, proto.ActionFanoutBatch:
-		c.dispatchBatchDeliver(frame[proto.HeaderSize:])
-	}
-}
-
-func (c *Client) dispatchSingleDeliver(frame []byte, hdr proto.Header) {
+func (c *Client) dispatchSingleDeliver(hdr proto.Header, frame []byte) {
 	c.deliveriesRecv.Add(1)
 
 	if len(frame) < proto.HeaderSize+proto.DeliverBodyOffset {
@@ -756,6 +792,13 @@ func (c *Client) dispatchSingleDeliver(frame []byte, hdr proto.Header) {
 	payloadOff := subjOff + subjLen
 	payloadLen := len(frame) - payloadOff
 
+	// Redelivery dedup (G18): if this consumer's ackstore slot has already
+	// recorded this seq, the handler ran before — re-ack without invoking it.
+	if sub.slot != nil && sub.slot.Seen(hdr.Seq) {
+		c.getConn().AckBatch.Ack(dh.ConsumerID, dh.SubjectHash, hdr.Seq)
+		return
+	}
+
 	msg := &Msg{
 		frame:       frame,
 		consumerID:  dh.ConsumerID,
@@ -766,13 +809,7 @@ func (c *Client) dispatchSingleDeliver(frame []byte, hdr proto.Header) {
 		payloadOff:  payloadOff,
 		payloadLen:  payloadLen,
 		client:      c,
-	}
-
-	if c.seenCache != nil && !c.seenCache.InsertIfNew(dh.ConsumerID, hdr.Seq) {
-		// Redelivery of a message already run through the user handler once
-		// (G18) — re-ack without invoking it again.
-		c.getConn().AckBatch.Ack(dh.ConsumerID, dh.SubjectHash, hdr.Seq)
-		return
+		slot:        sub.slot,
 	}
 
 	c.deliverToSub(sub, msg)
@@ -812,6 +849,13 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 			continue
 		}
 
+		// Redelivery dedup (G18) — re-ack without re-invoking the handler.
+		if sub.slot != nil && sub.slot.Seen(seq) {
+			c.getConn().AckBatch.Ack(consumerID, subjectHash, seq)
+			off = entryPayloadStart + totalTail
+			continue
+		}
+
 		// Build Msg referencing the batch buffer slice
 		subjOff := entryPayloadStart
 		replyToOff := entryPayloadStart + subjLen
@@ -830,13 +874,7 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 			payloadOff:  payloadOff,
 			payloadLen:  payloadLen,
 			client:      c,
-		}
-
-		if c.seenCache != nil && !c.seenCache.InsertIfNew(consumerID, seq) {
-			// Redelivery dedup (G18) — re-ack without re-invoking the handler.
-			c.getConn().AckBatch.Ack(consumerID, subjectHash, seq)
-			off = entryPayloadStart + totalTail
-			continue
+			slot:        sub.slot,
 		}
 
 		c.deliverToSub(sub, msg)
@@ -850,6 +888,22 @@ func (c *Client) lookupSub(consumerID uint32) *Subscription {
 		return nil
 	}
 	return val.(*Subscription)
+}
+
+// confirmAckStoreUpTo drops dedup entries ≤ cursor from the consumer's
+// ackstore slot. Driven by the broker cursor (AckBatchResp/AckStateRep): the
+// server will never redeliver at or below it, so those seqs need not be
+// remembered. This keeps the dedup set tiny on the normal ack path without a
+// periodic job. No-op if dedup is disabled or the consumer isn't tracked.
+func (c *Client) confirmAckStoreUpTo(consumerID uint32, cursor uint64) {
+	if c.ackStore == nil {
+		return
+	}
+	sub := c.lookupSub(consumerID)
+	if sub == nil || sub.slot == nil {
+		return
+	}
+	_, _ = sub.slot.ConfirmUpTo(cursor)
 }
 
 func (c *Client) deliverToSub(sub *Subscription, msg *Msg) {
@@ -930,7 +984,8 @@ func (c *Client) doReconnect() (*conn.Connection, error) {
 		return nil, err
 	}
 
-	newConn.SetDeliverHandler(c.handleDeliver)
+	newConn.SetDeliverHandler(c.dispatchSingleDeliver, c.dispatchBatchDeliver)
+	newConn.SetAckConfirmHandler(c.confirmAckStoreUpTo)
 	newConn.SetCronFireHandler(c.dispatchCronFire)
 	newConn.AckRelay = c.ackRelay
 

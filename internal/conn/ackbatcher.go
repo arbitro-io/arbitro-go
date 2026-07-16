@@ -2,16 +2,12 @@ package conn
 
 import (
 	"encoding/binary"
-	"time"
 
 	"github.com/arbitro-io/arbitro-go/internal/proto"
 )
 
 // ackBatchMax is the maximum number of acks to batch before flushing.
 const ackBatchMax = 64
-
-// ackFlushInterval is the maximum time to hold acks before flushing.
-const ackFlushInterval = time.Millisecond
 
 // AckItem represents a single ack to be batched.
 type AckItem struct {
@@ -21,8 +17,10 @@ type AckItem struct {
 }
 
 // AckBatcher accumulates individual acks and flushes them as BatchAck frames.
-// This reduces wire traffic from N individual 32-byte frames to one BatchAck
-// frame containing N entries — same pattern as the Rust client's ack_batcher_task.
+// Same shape as Rust ack_batcher_task (consume/mod.rs): recv() → drain-until-
+// empty → flush. No mandatory-wait timer — that timer capped single-msg ack
+// throughput at ~1kHz and was the direct cause of BenchmarkPubSubE2E stalls
+// (Go-HP1 audit finding).
 type AckBatcher struct {
 	ch   chan AckItem
 	conn *Connection
@@ -49,12 +47,7 @@ func (ab *AckBatcher) Ack(consumerID, subjectHash uint32, seq uint64) {
 }
 
 func (ab *AckBatcher) run() {
-	// Group acks by consumer_id for efficient BatchAck encoding.
-	// Most workloads have 1-3 active consumers, so a simple map is fine.
 	pending := make(map[uint32][]proto.AckEntry)
-	timer := time.NewTimer(ackFlushInterval)
-	timer.Stop()
-	timerActive := false
 
 	for {
 		select {
@@ -68,19 +61,25 @@ func (ab *AckBatcher) run() {
 				SubjectHash: item.SubjectHash,
 			})
 
-			// Check if any consumer hit the batch cap.
-			if len(pending[item.ConsumerID]) >= ackBatchMax {
-				ab.flushConsumer(pending, item.ConsumerID)
+		drain:
+			for {
+				select {
+				case it, ok := <-ab.ch:
+					if !ok {
+						ab.flush(pending)
+						return
+					}
+					pending[it.ConsumerID] = append(pending[it.ConsumerID], proto.AckEntry{
+						Seq:         it.Seq,
+						SubjectHash: it.SubjectHash,
+					})
+					if len(pending[it.ConsumerID]) >= ackBatchMax {
+						ab.flushConsumer(pending, it.ConsumerID)
+					}
+				default:
+					break drain
+				}
 			}
-
-			// Start the flush timer if not already active.
-			if !timerActive {
-				timer.Reset(ackFlushInterval)
-				timerActive = true
-			}
-
-		case <-timer.C:
-			timerActive = false
 			ab.flush(pending)
 
 		case <-ab.done:

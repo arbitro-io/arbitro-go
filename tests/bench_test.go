@@ -5,6 +5,8 @@ package tests
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,21 @@ import (
 
 	"github.com/arbitro-io/arbitro-go"
 )
+
+// envInt returns the int value of environment variable name, or def if unset
+// or unparseable. Used by benchmarks to tune msgCount / MaxInflight from the
+// shell (ARBITRO_BENCH_MSGS, ARBITRO_BENCH_INFLIGHT) without recompiling.
+func envInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
 
 // BenchmarkPublishSync measures synchronous publish throughput.
 func BenchmarkPublishSync(b *testing.B) {
@@ -35,7 +52,8 @@ func BenchmarkPublishSync(b *testing.B) {
 	}
 }
 
-// BenchmarkPublishAsync measures fire-and-forget throughput.
+// BenchmarkPublishAsync measures fire-and-forget throughput via
+// Client.PublishAsync (map-lookup path).
 func BenchmarkPublishAsync(b *testing.B) {
 	client := benchClient(b)
 	stream := benchStream(b, client)
@@ -50,6 +68,33 @@ func BenchmarkPublishAsync(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		client.PublishAsync(stream, stream+".bench", payload)
+	}
+}
+
+// BenchmarkStreamPublishAsync measures the same fire-and-forget path via
+// Stream.PublishAsync — cached streamID + single-alloc encode + unsafe
+// string→bytes for the subject. Should approach Rust client.publish() cost.
+func BenchmarkStreamPublishAsync(b *testing.B) {
+	client := benchClient(b)
+	streamName := benchStream(b, client)
+	// Prime the streamCache so Stream.PublishAsync hits the fast path.
+	ctx := context.Background()
+	if _, err := client.ResolveStreamID(ctx, streamName); err != nil {
+		b.Fatalf("resolve: %v", err)
+	}
+	stream := client.Stream(streamName)
+
+	payload := make([]byte, 128)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	subject := streamName + ".bench"
+
+	b.ResetTimer()
+	b.SetBytes(128)
+
+	for i := 0; i < b.N; i++ {
+		stream.PublishAsync(subject, payload)
 	}
 }
 
@@ -128,55 +173,175 @@ func BenchmarkPublishParallel(b *testing.B) {
 	})
 }
 
-// BenchmarkThroughput1K measures sustained throughput with 1000 messages.
+// BenchmarkThroughput1K measures sustained end-to-end throughput
+// (publish → deliver → ack). Tunable at runtime via:
+//
+//	ARBITRO_BENCH_MSGS       — messages published per iteration (default 5000)
+//	ARBITRO_BENCH_INFLIGHT   — consumer MaxInflight window   (default 1000)
+//	ARBITRO_BENCH_PAYLOAD    — payload size in bytes         (default 256)
+//	ARBITRO_BENCH_TIMEOUT_MS — per-iteration consume timeout (default 10000)
 func BenchmarkThroughput1K(b *testing.B) {
 	client := benchClient(b)
 	ctx := context.Background()
-	stream := benchStream(b, client)
+	streamName := benchStream(b, client)
 
-	const msgCount = 1000
-	payload := make([]byte, 256)
+	msgCount := envInt("ARBITRO_BENCH_MSGS", 5_000)
+	maxInflight := envInt("ARBITRO_BENCH_INFLIGHT", 1_000)
+	payloadSize := envInt("ARBITRO_BENCH_PAYLOAD", 256)
+	timeoutMs := envInt("ARBITRO_BENCH_TIMEOUT_MS", 10_000)
 
-	sub, err := client.Subscribe(ctx, stream, arbitro.ConsumerConfig{
+	if maxInflight > 65535 {
+		b.Fatalf("ARBITRO_BENCH_INFLIGHT=%d exceeds uint16 max (65535)", maxInflight)
+	}
+
+	payload := make([]byte, payloadSize)
+
+	// Ack mode: "explicit" (default, per-msg Ack) matches at-least-once
+	// semantics; "none" mirrors the Rust replay_drain bench (AckPolicy::None)
+	// for apples-to-apples comparison against server drain rate.
+	ackMode := os.Getenv("ARBITRO_BENCH_ACK")
+	ackPolicy := arbitro.AckExplicit
+	consumerInflight := uint16(maxInflight)
+	consumerAckWait := 30 * time.Second
+	if ackMode == "none" {
+		ackPolicy = arbitro.AckNone
+		consumerInflight = 0
+		consumerAckWait = 0
+	}
+
+	sub, err := client.Subscribe(ctx, streamName, arbitro.ConsumerConfig{
 		Name:        "bench-1k",
-		Filter:      stream + ".>",
-		AckPolicy:   arbitro.AckExplicit,
-		MaxInflight: 1000,
-		AckWait:     30 * time.Second,
+		Filter:      streamName + ".>",
+		AckPolicy:   ackPolicy,
+		MaxInflight: consumerInflight,
+		AckWait:     consumerAckWait,
 	})
 	if err != nil {
 		b.Fatalf("subscribe: %v", err)
 	}
 	defer sub.Close()
 
+	// Prime the stream cache and grab a Stream handle so the publisher goroutine
+	// hits the fast path (cached streamID, single-alloc encode).
+	if _, err := client.ResolveStreamID(ctx, streamName); err != nil {
+		b.Fatalf("resolve: %v", err)
+	}
+	stream := client.Stream(streamName)
+	subject := streamName + ".throughput"
+
+	b.Logf("throughput bench: msgs=%d inflight=%d payload=%dB timeout=%dms ack=%s seen_disabled=%v",
+		msgCount, maxInflight, payloadSize, timeoutMs, ackMode,
+		os.Getenv("ARBITRO_GO_DISABLE_SEEN") == "1")
+
+	ackPerMsg := ackPolicy == arbitro.AckExplicit
+
 	b.ResetTimer()
 
 	for iter := 0; iter < b.N; iter++ {
-		// Publish 1000 messages
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < msgCount; i++ {
-				_ = client.Publish(ctx, stream, stream+".throughput", payload)
+				stream.PublishAsync(subject, payload)
 			}
 		}()
 
-		// Consume and ack all
 		var acked atomic.Int32
-		for acked.Load() < msgCount {
+		target := int32(msgCount)
+
+		// A single Timer, Reset per message — avoids the time.After() Go
+		// antipattern which allocates a new channel+timer per iteration
+		// and leaks them into the runtime timer heap for the full 10s TTL.
+		// This was a serious contributor to the throughput ceiling.
+		iterTimeout := time.Duration(timeoutMs) * time.Millisecond
+		timer := time.NewTimer(iterTimeout)
+		defer timer.Stop()
+
+		for acked.Load() < target {
+			// Reset the timer for THIS message; drain any leftover fire so
+			// the next select doesn't see a stale value.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(iterTimeout)
+
 			select {
 			case msg := <-sub.Messages():
-				msg.Ack()
+				if ackPerMsg {
+					msg.Ack()
+				}
 				acked.Add(1)
-			case <-time.After(10 * time.Second):
-				b.Fatalf("timeout at %d/%d", acked.Load(), msgCount)
+			case <-timer.C:
+				b.Fatalf("timeout at %d/%d", acked.Load(), target)
 			}
 		}
 		wg.Wait()
 	}
 
-	b.SetBytes(256 * msgCount)
+	b.SetBytes(int64(payloadSize * msgCount))
+}
+
+// BenchmarkReplayDrain mirrors Rust's arbitro-e2e/benches/throughput.rs
+// `replay_drain`: pre-load N msgs onto the stream, THEN subscribe and drain.
+// Consumer does not compete with a live publisher — this isolates pure
+// broker→client delivery throughput. Matches the Rust bench 1:1 for a fair
+// cross-client comparison.
+func BenchmarkReplayDrain(b *testing.B) {
+	client := benchClient(b)
+	ctx := context.Background()
+	streamName := benchStream(b, client)
+
+	msgCount := envInt("ARBITRO_BENCH_MSGS", 5_000)
+	payloadSize := envInt("ARBITRO_BENCH_PAYLOAD", 64)
+
+	if _, err := client.ResolveStreamID(ctx, streamName); err != nil {
+		b.Fatalf("resolve: %v", err)
+	}
+	stream := client.Stream(streamName)
+	payload := make([]byte, payloadSize)
+	subject := streamName + ".replay"
+
+	// Pre-load N msgs into the stream (fire-and-forget) and wait for them
+	// to be durably visible via a sync flush publish.
+	for i := 0; i < msgCount; i++ {
+		stream.PublishAsync(subject, payload)
+	}
+	if err := client.Publish(ctx, streamName, subject, payload); err != nil {
+		b.Fatalf("flush publish: %v", err)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(int64(payloadSize * msgCount))
+
+	for iter := 0; iter < b.N; iter++ {
+		sub, err := client.Subscribe(ctx, streamName, arbitro.ConsumerConfig{
+			Name:        fmt.Sprintf("replay-drain-%d-%d", time.Now().UnixNano(), iter),
+			Filter:      streamName + ".>",
+			AckPolicy:   arbitro.AckNone,
+			MaxInflight: 0,
+			DeliverPolicy: arbitro.DeliverAll,
+		})
+		if err != nil {
+			b.Fatalf("subscribe iter %d: %v", iter, err)
+		}
+
+		received := 0
+		timer := time.NewTimer(15 * time.Second)
+		for received < msgCount {
+			select {
+			case <-sub.Messages():
+				received++
+			case <-timer.C:
+				b.Fatalf("iter %d timeout at %d/%d", iter, received, msgCount)
+			}
+		}
+		timer.Stop()
+		sub.Close()
+	}
 }
 
 // BenchmarkPublishBatchAsync measures fire-and-forget batch publish throughput.

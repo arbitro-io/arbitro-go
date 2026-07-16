@@ -493,7 +493,7 @@ func (b *WorkflowBuilder) upsertInternalStream(ctx context.Context, name, subjec
 		}
 		return 0, err
 	}
-	return s.streamID, nil
+	return s.streamID.Load(), nil
 }
 
 // ── WorkflowHandle ────────────────────────────────────────────────────────

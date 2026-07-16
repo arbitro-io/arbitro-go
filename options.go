@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"time"
+
+	"github.com/arbitro-io/arbitro-go/internal/ackstore"
 )
 
 // Option configures the client.
@@ -18,6 +20,14 @@ type clientOptions struct {
 	tlsConfig *tls.Config
 	logger    *slog.Logger
 	keepAlive KeepAlive
+
+	// ackStore backs the client's redelivery-dedup guarantee. Default is an
+	// in-memory store (dedup within the process lifetime). WithAckPersistence
+	// swaps in a durable WAL store that survives process restart. Nil disables
+	// dedup entirely (at-least-once, handler may run more than once).
+	ackStore    ackstore.Store
+	ackStoreErr error // deferred error from WithAckPersistence, checked at Connect
+	ackDedup    bool  // whether to consult the store on delivery
 }
 
 // KeepAlive configures the client heartbeat / dead-connection watchdog.
@@ -44,6 +54,51 @@ func defaultOptions() clientOptions {
 		maxRetries:    10,
 		retryInterval: 500 * time.Millisecond,
 		keepAlive:     defaultKeepAlive(),
+		ackDedup:      true, // in-memory dedup on by default
+	}
+}
+
+// WithAckStore injects a custom ackstore.Store for redelivery dedup. Advanced
+// callers use this to supply a pre-configured WAL (ackstore.OpenWAL) with a
+// specific directory, TTL, fsync policy, and cap. Passing a store implies
+// dedup is enabled.
+func WithAckStore(store ackstore.Store) Option {
+	return func(o *clientOptions) {
+		o.ackStore = store
+		o.ackDedup = store != nil
+	}
+}
+
+// WithAckPersistence enables durable, restart-surviving redelivery dedup
+// backed by a WAL at dir. ttl bounds how long a recorded ack is remembered
+// (0 = never expire). fsync=true trades throughput for power-loss durability.
+// This is a convenience over WithAckStore(ackstore.OpenWAL(...)).
+func WithAckPersistence(dir string, ttl time.Duration, fsync bool) Option {
+	return func(o *clientOptions) {
+		w, err := ackstore.OpenWAL(ackstore.Config{
+			Dir:            dir,
+			TTL:            ttl,
+			Fsync:          fsync,
+			CompactAtBytes: 64 * 1024 * 1024, // auto-compact past 64 MiB
+		})
+		if err != nil {
+			// Surface the failure at Connect time via a sentinel; the client
+			// checks o.ackStore != nil and o.ackStoreErr.
+			o.ackStoreErr = err
+			return
+		}
+		o.ackStore = w
+		o.ackDedup = true
+	}
+}
+
+// WithoutAckDedup disables redelivery dedup entirely (pure at-least-once; the
+// user handler may run more than once for a redelivered message). Slightly
+// faster; requires idempotent handlers.
+func WithoutAckDedup() Option {
+	return func(o *clientOptions) {
+		o.ackStore = nil
+		o.ackDedup = false
 	}
 }
 
