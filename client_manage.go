@@ -214,6 +214,22 @@ func (c *Client) CreateConsumer(ctx context.Context, stream string, cfg Consumer
 	return c.ensureConsumer(ctx, stream, cfg)
 }
 
+// UpsertConsumer is the create-or-return-existing variant of CreateConsumer,
+// mirroring arbitro-client-tokio's Client::upsert_consumer (client.rs:783) and
+// the local UpsertStream idiom. ConsumerAlreadyExists is the idempotent path:
+// the existing consumer's ID is resolved and returned.
+func (c *Client) UpsertConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (uint32, error) {
+	id, err := c.CreateConsumer(ctx, stream, cfg)
+	if err != nil && IsAlreadyExists(err) {
+		streamID, err2 := c.resolveStreamID(ctx, stream)
+		if err2 != nil {
+			return 0, err2
+		}
+		return c.resolveConsumerID(ctx, streamID, cfg.Name)
+	}
+	return id, err
+}
+
 // DeleteConsumer removes a consumer by stream name and consumer name.
 // The wire body carries only `consumer_id`, so (stream, name) is resolved to a
 // numeric ID before the delete is sent.
@@ -294,6 +310,19 @@ func (c *Client) ConsumerInfo(ctx context.Context, stream, name string) (*Consum
 	}
 	// TODO: parse full consumer info from JSON body
 	return &ConsumerInfo{Name: name, StreamID: streamID}, nil
+}
+
+// ConsumerExists reports whether the broker has a consumer registered under
+// (stream, name). Mirrors arbitro-client-tokio's Client::consumer_exists
+// (client.rs:725) and the local StreamExists idiom — ConsumerInfo maps
+// ConsumerNotFound/StreamNotFound to (nil, nil), so a missing consumer is
+// reported as (false, nil), not an error.
+func (c *Client) ConsumerExists(ctx context.Context, stream, name string) (bool, error) {
+	info, err := c.ConsumerInfo(ctx, stream, name)
+	if err != nil {
+		return false, err
+	}
+	return info != nil, nil
 }
 
 // ListConsumers returns all consumers for a stream. Pass stream="" to list
