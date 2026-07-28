@@ -217,6 +217,80 @@ type MsgCopy struct {
 	Seq     uint64
 }
 
+// QueueOptions tunes a durable work queue. The zero value is the common
+// case: Group defaults to the stream name, no subject filter, broker-default
+// redelivery deadline, unlimited in-flight.
+//
+// AckPolicy is deliberately absent — a work queue is always AckExplicit.
+// Letting a caller pick AckNone would build a queue that silently drops jobs
+// when a worker dies, which is the one thing a queue exists to prevent.
+type QueueOptions struct {
+	// Queue identity. Workers sharing it share one round-robin queue; a
+	// different value is a separate, independent durable queue. Empty means
+	// the stream name.
+	//
+	// This single value becomes both the durable consumer name and the queue
+	// group — they always move together, so two workers can never disagree
+	// on the consumer config.
+	Group string
+
+	// Subject filter for this subscription. Empty means every subject in the
+	// stream. Applied per-subscription, so workers on one queue may each
+	// narrow to a different slice without colliding.
+	Filter string
+
+	// How long the broker waits for an ack before handing the job back to
+	// the queue. Zero keeps the broker default. Raise it for handlers that
+	// legitimately run long, otherwise a slow success is indistinguishable
+	// from a crashed worker.
+	AckWait time.Duration
+
+	// Cap on delivered-but-unacked messages across the queue — the
+	// backpressure valve. Zero is unlimited.
+	MaxInflight uint16
+
+	// Where a brand-new queue starts reading. Ignored on later joins, when
+	// the durable cursor already exists and the queue resumes from it.
+	DeliverPolicy uint32
+	StartSeq      uint64
+
+	// Per-subject in-flight caps. Each distinct subject keeps its own count.
+	MaxSubjectInflights []SubjectLimit
+}
+
+// QueueSubscribe joins a durable work queue on stream in one call. Every
+// worker calls it with the same Group and the broker load-balances between
+// them, so each message is delivered to exactly ONE member of the queue.
+//
+// A DIFFERENT Group is a separate, independent durable queue over the same
+// stream — its own cursor, its own copy of the messages.
+//
+// The queue is durable and explicit-ack: it survives broker restarts and
+// worker disconnects, and redelivers anything a worker took but never acked.
+// Messages must be acked.
+//
+//	sub, err := c.QueueSubscribe(ctx, "orders",
+//	    arbitro.QueueOptions{Filter: "orders.>"},
+//	    arbitro.WithHandler(func(m *arbitro.Msg) { process(m); m.Ack() }))
+func (c *Client) QueueSubscribe(ctx context.Context, stream string, q QueueOptions, opts ...SubscribeOption) (*Subscription, error) {
+	group := q.Group
+	if group == "" {
+		group = stream
+	}
+	return c.Subscribe(ctx, stream, ConsumerConfig{
+		Name:                group,
+		Group:               group,
+		Filter:              q.Filter,
+		Fanout:              false,
+		AckPolicy:           AckExplicit,
+		AckWait:             q.AckWait,
+		MaxInflight:         q.MaxInflight,
+		DeliverPolicy:       q.DeliverPolicy,
+		StartSeq:            q.StartSeq,
+		MaxSubjectInflights: q.MaxSubjectInflights,
+	}, opts...)
+}
+
 // Subscribe creates a consumer (if needed) and starts receiving messages.
 func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfig, opts ...SubscribeOption) (*Subscription, error) {
 	so := subscribeOptions{}
