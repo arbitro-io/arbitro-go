@@ -251,7 +251,11 @@ type QueueOptions struct {
 
 	// Where a brand-new queue starts reading. Ignored on later joins, when
 	// the durable cursor already exists and the queue resumes from it.
-	DeliverPolicy uint32
+	//
+	// uint8 because that is the width of the wire field -- a wider value
+	// would fail serde decode broker-side and surface as a generic
+	// InternalError with no clue as to the cause.
+	DeliverPolicy uint8
 	StartSeq      uint64
 
 	// Per-subject in-flight caps. Each distinct subject keeps its own count.
@@ -277,18 +281,29 @@ func (c *Client) QueueSubscribe(ctx context.Context, stream string, q QueueOptio
 	if group == "" {
 		group = stream
 	}
+	// A negative AckWait would wrap to a huge value in the u32 wire field;
+	// treat it as unset rather than as ~49 days.
+	ackWait := q.AckWait
+	if ackWait < 0 {
+		ackWait = 0
+	}
+	// The subject filter belongs to the subscription, not the consumer:
+	// workers on one queue may narrow differently, and a consumer-level
+	// filter would durably record the first joiner's view for everyone. So
+	// the consumer is created with an empty subject and the filter is
+	// applied to the Subscribe frame only, matching the Rust and C clients.
 	return c.Subscribe(ctx, stream, ConsumerConfig{
 		Name:                group,
 		Group:               group,
-		Filter:              q.Filter,
+		Filter:              "",
 		Fanout:              false,
 		AckPolicy:           AckExplicit,
-		AckWait:             q.AckWait,
+		AckWait:             ackWait,
 		MaxInflight:         q.MaxInflight,
-		DeliverPolicy:       q.DeliverPolicy,
+		DeliverPolicy:       uint32(q.DeliverPolicy),
 		StartSeq:            q.StartSeq,
 		MaxSubjectInflights: q.MaxSubjectInflights,
-	}, opts...)
+	}, append(opts, withSubFilter(q.Filter))...)
 }
 
 // Subscribe creates a consumer (if needed) and starts receiving messages.
@@ -326,10 +341,15 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 		}
 	}
 
-	// Send Subscribe frame
+	// Send Subscribe frame. QueueSubscribe supplies the filter here rather
+	// than in cfg so the consumer itself is created with an empty subject.
+	subFilter := cfg.Filter
+	if so.subFilter != nil {
+		subFilter = *so.subFilter
+	}
 	var filters [][]byte
-	if cfg.Filter != "" {
-		filters = [][]byte{[]byte(c.prefixed(cfg.Filter))}
+	if subFilter != "" {
+		filters = [][]byte{[]byte(c.prefixed(subFilter))}
 	}
 
 	// Register subscription in dispatch table, and stash the filters so the

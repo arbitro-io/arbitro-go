@@ -144,11 +144,19 @@ type SubscribeOption func(*subscribeOptions)
 
 type subscribeOptions struct {
 	handler func(*Msg)
+	// Overrides ConsumerConfig.Filter for the Subscribe frame only, letting
+	// a caller narrow the subscription while the consumer itself is created
+	// with an empty subject. Unexported: internal to QueueSubscribe.
+	subFilter *string
 }
 
 // WithHandler sets a callback-based handler instead of channel delivery.
 func WithHandler(fn func(*Msg)) SubscribeOption {
 	return func(o *subscribeOptions) { o.handler = fn }
+}
+
+func withSubFilter(filter string) SubscribeOption {
+	return func(o *subscribeOptions) { o.subFilter = &filter }
 }
 
 // PublishOption configures a publish call.
