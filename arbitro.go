@@ -623,10 +623,16 @@ func (c *Client) ensureReqReplySub(ctx context.Context, streamID uint32, stream 
 	replyName := fmt.Sprintf("_reply-%s-%d", stream, c.reqInstanceID)
 
 	seq := c.getConn().NextSeq()
+	// Group = replyName. This consumer must NOT be load-balanced, and it is
+	// not: replyName embeds reqInstanceID, so the group is unique to this
+	// client instance and has exactly one member. The group is filled in
+	// rather than left empty because the broker rejects an empty group (an
+	// empty group in queue mode would otherwise collapse every anonymous
+	// consumer on the stream into one shared queue).
 	frame, err := proto.EncodeCreateConsumer(
 		seq, streamID,
-		[]byte(replyName), nil, []byte(replyFilter),
-		1024, AckExplicit, DeliverNew, 0, // Fanout mode, no group — not load-balanced
+		[]byte(replyName), []byte(replyName), []byte(replyFilter),
+		1024, AckExplicit, DeliverNew, 0, // Fanout mode, per-instance group
 		30_000, 0, nil,
 	)
 	if err != nil {

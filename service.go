@@ -314,13 +314,23 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 	}
 
 	// ── Worker consumer: queue-grouped, receives ONLY method calls. ──
+	//
+	// The NAME must be per-instance and the GROUP service-wide. Using the
+	// service-wide name for both collapses every instance onto one consumer
+	// id, hence one subscription id, and the broker allows a single binding
+	// per subscription — so each instance that starts RETIRES the previous
+	// one's binding and only the last to boot receives anything. Queue mode
+	// does not save you: the instances never coexist to share the load.
+	// Distinct names give each instance its own binding; the shared group
+	// gives them one queue, so the broker hands each request to exactly one.
 	workerFilter := svcPrefix + b.name + methodInfix + ">"
-	workerName := "_svc-" + b.name + "-worker"
+	workerGroup := "_svc-" + b.name + "-worker"
+	workerName := workerGroup + "-" + strconv.FormatUint(uint64(svc.instanceID), 10)
 
 	seq = b.client.getConn().NextSeq()
 	frame, err = proto.EncodeCreateConsumer(
 		seq, streamID,
-		[]byte(workerName), []byte(workerName), []byte(workerFilter),
+		[]byte(workerName), []byte(workerGroup), []byte(workerFilter),
 		uint16(maxInfl), AckExplicit, DeliverAll, 1, // Queue mode
 		30_000, 0, nil,
 	)
@@ -348,16 +358,19 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 		workerConsumerID = uint32(proto.RepOkRefSeq(body))
 	}
 
-	// ── Reply consumer: per-instance, NO group. ──
-	// Replies MUST NOT be load-balanced to sibling instances.
+	// ── Reply consumer: per-instance group. ──
+	// Replies MUST NOT be load-balanced to sibling instances, and they are
+	// not: replyName embeds this instance's ID, so the group has exactly one
+	// member. The group is set rather than left empty because the broker
+	// rejects an empty group.
 	replyFilter := svcPrefix + b.name + replyInfix + strconv.FormatUint(uint64(svc.instanceID), 10) + ".>"
 	replyName := "_svc-" + b.name + "-reply-" + strconv.FormatUint(uint64(svc.instanceID), 10)
 
 	seq = b.client.getConn().NextSeq()
 	frame, err = proto.EncodeCreateConsumer(
 		seq, streamID,
-		[]byte(replyName), nil, []byte(replyFilter),
-		uint16(maxInfl), AckExplicit, DeliverNew, 0, // Fanout mode, no group
+		[]byte(replyName), []byte(replyName), []byte(replyFilter),
+		uint16(maxInfl), AckExplicit, DeliverNew, 0, // Fanout mode, per-instance group
 		30_000, 0, nil,
 	)
 	if err != nil {

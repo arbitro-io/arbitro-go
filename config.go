@@ -37,7 +37,17 @@ type StreamConfig struct {
 
 // ConsumerConfig defines consumer creation parameters.
 type ConsumerConfig struct {
-	Name                string
+	// Name is the durable consumer name. Defaults to the stream name.
+	Name string
+	// Group is the queue group. It defaults to Name, and therefore to the
+	// stream name when Name is also empty — unconditionally, whatever Fanout
+	// is set to. The client never puts an empty group on the wire; the broker
+	// rejects one.
+	//
+	// In queue mode (Fanout false) the group is the unit of load balancing:
+	// members of one group share the messages round-robin, different groups
+	// each get their own copy. In fanout mode the group is inert, and the
+	// name-derived default is a group of one, so fanout delivery is unchanged.
 	Group               string
 	Filter              string
 	Fanout              bool

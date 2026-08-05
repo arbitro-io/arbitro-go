@@ -371,6 +371,41 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 	return sub, nil
 }
 
+// resolveConsumerNaming applies the consumer naming defaults shared by every
+// arbitro client (arbitro-ts client.ts:521 is the reference):
+//
+//	name  = cfg.Name  else stream
+//	group = cfg.Group else name else stream
+//
+// The group default is UNCONDITIONAL — it does NOT depend on the delivery
+// mode. Two reasons:
+//
+//   - An empty group is never a useful request. On the broker an empty group
+//     in queue mode allocates a real shared queue keyed (stream_id, ""), so
+//     every no-group queue consumer on that stream silently lands in one
+//     anonymous queue together. The broker now rejects an empty group
+//     outright; filling it in is the client's job.
+//   - Making the default conditional on the mode (the previous
+//     `if !cfg.Fanout && group == ""` form) left fanout consumers sending an
+//     empty group on the wire, which is exactly the request the broker
+//     rejects.
+//
+// Defaulting the group to the consumer name is safe in fanout mode: the group
+// only partitions delivery among consumers that SHARE it, and the consumer
+// name is unique per stream, so a name-derived group is a group of one and
+// fanout delivery is unchanged.
+func resolveConsumerNaming(cfgName, cfgGroup, stream string) (name, group string) {
+	name = cfgName
+	if name == "" {
+		name = stream
+	}
+	group = cfgGroup
+	if group == "" {
+		group = name
+	}
+	return name, group
+}
+
 func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg ConsumerConfig) (uint32, error) {
 	if err := cfg.Validate(); err != nil {
 		return 0, err
@@ -382,14 +417,7 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 		return 0, err
 	}
 
-	name := cfg.Name
-	if name == "" {
-		name = stream
-	}
-	group := cfg.Group
-	if !cfg.Fanout && group == "" {
-		group = name
-	}
+	name, group := resolveConsumerNaming(cfg.Name, cfg.Group, stream)
 
 	subjectLimits := make([]proto.SubjectLimitJSON, len(cfg.MaxSubjectInflights))
 	for i, sl := range cfg.MaxSubjectInflights {

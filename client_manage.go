@@ -225,7 +225,10 @@ func (c *Client) UpsertConsumer(ctx context.Context, stream string, cfg Consumer
 		if err2 != nil {
 			return 0, err2
 		}
-		return c.resolveConsumerID(ctx, streamID, cfg.Name)
+		// The name must go through the same defaulting ensureConsumer applied
+		// when it created the consumer, or an unnamed config would look up "".
+		name, _ := resolveConsumerNaming(cfg.Name, cfg.Group, stream)
+		return c.resolveConsumerID(ctx, streamID, name)
 	}
 	return id, err
 }

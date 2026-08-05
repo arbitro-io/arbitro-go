@@ -357,10 +357,13 @@ func (b *WorkflowBuilder) Start(ctx context.Context) (*WorkflowHandle, error) {
 	}
 
 	// Fanout consumer on state stream — unique per worker, DeliverPolicy::All.
+	// Group = the consumer name (per-worker unique), so the group has exactly
+	// one member and fanout delivery is unaffected. An empty group is not an
+	// option: the broker rejects it.
 	stateConsumerName := fmt.Sprintf("_wf_%s_state_w%s", name, workerUID)
 	stateSub, err := b.client.Subscribe(ctx, stateStreamName, ConsumerConfig{
 		Name:        stateConsumerName,
-		Group:       "", // empty group → fanout
+		Group:       stateConsumerName,
 		Fanout:      true,
 		Filter:      stateSubject,
 		AckPolicy:   AckExplicit,
