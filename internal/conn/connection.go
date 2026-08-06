@@ -373,11 +373,35 @@ func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 // to an AckStateReq sent on reconnect). Mirrors dispatch_ack_state_rep in
 // the Rust client's transport/reader.rs.
 func (c *Connection) handleAckStateRep(body []byte) {
-	if c.AckRelay == nil {
+	consumerID, generation, cursor, lowSeq, _, status, err := proto.DecodeAckStateRep(body)
+	if err != nil {
 		return
 	}
-	consumerID, generation, cursor, lowSeq, _, _, err := proto.DecodeAckStateRep(body)
-	if err != nil {
+
+	// Durable dedup: on-connect WAL purge (cold path). The broker's cursor
+	// is authoritative for the consumer currently registered under this id —
+	// it never (re)delivers seqs <= cursor to it, so dropping them from the
+	// ackstore live set can never cause a duplicate execution. This runs
+	// BEFORE (and independent of) the ack-relay generation check below: the
+	// ackstore slot is keyed by durable (stream, consumer) names, and a fresh
+	// process (relay generation 0, broker generation possibly bumped by
+	// consumer-id recycling) must still purge entries recorded by a previous,
+	// dead session — that reconnect purge is the whole point of the
+	// on-(re)connect AckStateReq.
+	//
+	// Deliberate conservatism: the purge only runs when the broker vouches
+	// for the cursor (status == OK). On any other status — notably
+	// AckStatusConsumerUnknown (consumer deleted, or broker restarted without
+	// it) — we purge NOTHING, even though the entries are probably useless: a
+	// recreated same-name consumer will answer a later request with OK and
+	// its own cursor, and stale high-seq entries are left to the store TTL. A
+	// wrongly kept entry costs a little disk; a wrongly dropped one costs a
+	// duplicate execution of real work.
+	if status == proto.AckStatusOK && c.onAckConfirm != nil {
+		c.onAckConfirm(consumerID, cursor)
+	}
+
+	if c.AckRelay == nil {
 		return
 	}
 	if generation != c.AckRelay.Generation(consumerID) {
@@ -391,10 +415,7 @@ func (c *Connection) handleAckStateRep(body []byte) {
 	if lowSeq > 0 {
 		// Below the broker's retention floor — will never be confirmable.
 		c.AckRelay.ConfirmUpTo(consumerID, lowSeq-1)
-	}
-	if c.onAckConfirm != nil {
-		c.onAckConfirm(consumerID, cursor)
-		if lowSeq > 0 {
+		if c.onAckConfirm != nil {
 			c.onAckConfirm(consumerID, lowSeq-1)
 		}
 	}

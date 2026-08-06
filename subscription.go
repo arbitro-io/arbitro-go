@@ -368,6 +368,24 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 		return nil, err
 	}
 
+	// On-connect ackstore purge: the store may hold entries recorded by a
+	// previous, dead session (its AckBatchResp never arrived, so nothing
+	// confirmed them). Ask the broker for its authoritative ack cursor ONCE,
+	// now that the subscribe is confirmed (the consumer provably exists
+	// server-side); handleAckStateRep drops every entry at or below that
+	// cursor. Cold path — one 24 B fire-and-forget frame per subscribe,
+	// nothing on the delivery/ack hot path. Reconnects are covered
+	// separately by replayAckState.
+	if sub.slot != nil {
+		cn := c.getConn()
+		var gen uint32
+		if c.ackRelay != nil {
+			gen = c.ackRelay.Generation(consumerID)
+		}
+		reqSeq := cn.NextSeq()
+		_ = cn.Send(proto.EncodeAckStateReq(reqSeq, consumerID, gen))
+	}
+
 	return sub, nil
 }
 

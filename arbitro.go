@@ -1022,16 +1022,44 @@ func (c *Client) doReconnect() (*conn.Connection, error) {
 // replayed as AckBatch frames; on mismatch it's reconciled (wiped) instead.
 // Mirrors the Rust supervisor's conn::session::send_ack_state_reqs, which
 // forwards `s.generation` from `active_consumers()` unmodified (G01).
+//
+// It ALSO queries every subscription that carries a durable ackstore slot,
+// even with no deferred acks outstanding: ackstore entries recorded by a
+// session that died before its AckBatchResp arrived are never confirmed by
+// the normal flow, so each reconnect asks the broker for its authoritative
+// cursor once and handleAckStateRep drops everything at or below it. Cold
+// path — one 24 B frame per consumer per reconnect, nothing added to the
+// delivery/ack hot path.
 func (c *Client) replayAckState(newConn *conn.Connection) {
-	if c.ackRelay == nil {
-		return
+	sent := make(map[uint32]struct{})
+	if c.ackRelay != nil {
+		for _, cid := range c.ackRelay.ActiveConsumers() {
+			gen := c.ackRelay.Generation(cid)
+			seq := newConn.NextSeq()
+			frame := proto.EncodeAckStateReq(seq, cid, gen)
+			_ = newConn.Send(frame)
+			sent[cid] = struct{}{}
+		}
 	}
-	for _, cid := range c.ackRelay.ActiveConsumers() {
-		gen := c.ackRelay.Generation(cid)
+	// Durable-dedup consumers with no deferred acks still need the cursor
+	// snapshot (an idle consumer never sees an AckBatchResp).
+	c.subs.Range(func(key, value any) bool {
+		cid := key.(uint32)
+		sub := value.(*Subscription)
+		if sub.slot == nil {
+			return true
+		}
+		if _, dup := sent[cid]; dup {
+			return true
+		}
+		var gen uint32
+		if c.ackRelay != nil {
+			gen = c.ackRelay.Generation(cid)
+		}
 		seq := newConn.NextSeq()
-		frame := proto.EncodeAckStateReq(seq, cid, gen)
-		_ = newConn.Send(frame)
-	}
+		_ = newConn.Send(proto.EncodeAckStateReq(seq, cid, gen))
+		return true
+	})
 }
 
 // replaySubscriptions re-sends a Subscribe frame for every consumer_id that
