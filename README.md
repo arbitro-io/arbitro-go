@@ -94,10 +94,10 @@ client.PublishBatchAsync("orders", entries)
 
 // Delayed -- delivered after duration
 err = client.PublishDelayed(ctx, "orders", "orders.reminder", payload, 30*time.Second)
-
-// Request/Reply -- see Service section below for the full RPC pattern
-response, err := client.Request(ctx, "orders", "orders.validate", requestPayload, 5*time.Second)
 ```
+
+Request/reply is not a publish operation -- it belongs to a service. See the
+Service section below.
 
 ## Publish with Headers
 
@@ -205,7 +205,9 @@ gateway, _ := client.Service("gateway").Build(ctx)
 resp, _ := gateway.Request(ctx, "calculator", "multiply", []byte("3*4"), 5*time.Second)
 ```
 
-`msg.Reply()` always works -- no need to check for reply_to presence.
+Handlers answer by returning bytes. There is no `Reply()` to call: the
+framework publishes the return value to the requester and pairs it with
+exactly one ack or nack. Returning an error nacks for redelivery.
 
 ## Per-Subject Inflight Limits
 
@@ -366,7 +368,6 @@ msg.Subject()      // string
 msg.SubjectBytes() // []byte (zero-alloc)
 msg.Data()         // []byte (zero-copy into frame buffer)
 msg.ReplyTo()      // []byte (reply_to field, nil if none)
-msg.Reply(payload) // send response (decodes reply_to automatically)
 msg.Seq()          // uint64
 msg.ConsumerID()   // uint32
 msg.Dup()          // bool (redelivery flag)

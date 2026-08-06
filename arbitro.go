@@ -21,8 +21,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,26 +30,6 @@ import (
 	"github.com/arbitro-io/arbitro-go/internal/conn"
 	"github.com/arbitro-io/arbitro-go/internal/proto"
 )
-
-// defaultRequestTimeout is applied by Client.Request when the caller passes
-// timeout<=0 (a bare context.WithTimeout(ctx, 0) would expire immediately,
-// which is never useful).
-const defaultRequestTimeout = 30 * time.Second
-
-var nextReqInstanceID atomic.Uint32
-
-// newReqInstanceID returns a nonzero, per-process-unique instance id used to
-// scope this Client's standalone Request() reply subjects
-// (`_reply.<instanceID>.<corrID>`) so replies never collide across Client
-// instances sharing a broker.
-func newReqInstanceID() uint32 {
-	for {
-		id := nextReqInstanceID.Add(1)
-		if id != 0 {
-			return id
-		}
-	}
-}
 
 // Client is the main handle to the Arbitro broker.
 type Client struct {
@@ -79,16 +57,6 @@ type Client struct {
 	// Cron registry
 	cronMu sync.Mutex
 	crons  map[string]*cronEntry
-
-	// Request/reply correlation (standalone, outside Service). reqInstanceID
-	// scopes this client's reply subjects; reqSubs lazily holds one reply
-	// Subscription per stream (created on first Request() call for that
-	// stream), guarded by reqSubMu.
-	reqCorrID     atomic.Uint64
-	reqPending    sync.Map // map[uint64]chan []byte
-	reqInstanceID uint32
-	reqSubMu      sync.Mutex
-	reqSubs       map[uint32]*Subscription // map[streamID]*Subscription
 
 	// Ack-reliability hot tier (G01) — outlives any single Connection,
 	// re-attached to the new Connection after every reconnect.
@@ -201,8 +169,6 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 	// (surfaced via the AcksExpired metric, G14) rather than retried
 	// forever — mirrors the Rust hot tier's TTL sweep (ackrel expire()).
 	client.ackRelay.SetExpireTTL(60 * time.Second)
-	client.reqInstanceID = newReqInstanceID()
-	client.reqSubs = make(map[uint32]*Subscription)
 	client.connPtr.Store(c)
 	c.AckRelay = client.ackRelay
 
@@ -566,164 +532,6 @@ func (c *Client) PublishWithHeaders(ctx context.Context, stream, subject string,
 	}
 	c.publishesSent.Add(1)
 	return nil
-}
-
-// Request performs a standalone request/reply RPC: it publishes payload to
-// (stream, subject) with a reply-to address scoped to this Client instance,
-// lazily creates (once per stream) a fanout reply consumer subscribed to
-// that address, and blocks until either a reply arrives or timeout elapses.
-//
-// This does NOT require a Service to be registered — any responder that
-// calls Msg.Reply() on the delivered message satisfies it. For a full
-// request/response service with method routing, use client.Service(name).
-func (c *Client) Request(ctx context.Context, stream, subject string, payload []byte, timeout time.Duration) ([]byte, error) {
-	streamID, err := c.resolveStreamID(ctx, stream)
-	if err != nil {
-		return nil, err
-	}
-
-	if timeout <= 0 {
-		timeout = defaultRequestTimeout
-	}
-
-	if _, err := c.ensureReqReplySub(ctx, streamID, stream); err != nil {
-		return nil, err
-	}
-
-	corrID := c.reqCorrID.Add(1)
-	subj := c.prefixed(subject)
-	replySubject := fmt.Sprintf("_reply.%d.%d", c.reqInstanceID, corrID)
-
-	replyTo := make([]byte, 5+len(replySubject))
-	replyTo[0] = ReplyToMagic
-	binary.LittleEndian.PutUint32(replyTo[1:5], streamID)
-	copy(replyTo[5:], replySubject)
-
-	seq := c.getConn().NextSeq()
-	frame := proto.EncodePublishWithReply(seq, streamID, []byte(subj), replyTo, nil, payload, proto.FlagAckReq)
-
-	ch := make(chan []byte, 1)
-	c.reqPending.Store(corrID, ch)
-	defer c.reqPending.Delete(corrID)
-
-	tctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	_, err = c.getConn().SendExpectReply(tctx, frame, seq)
-	if err != nil {
-		return nil, err
-	}
-
-	select {
-	case data := <-ch:
-		return data, nil
-	case <-tctx.Done():
-		return nil, &ArbitroError{Code: ErrCodeTimeout, Message: "request timeout"}
-	}
-}
-
-// ensureReqReplySub lazily creates (once per streamID) the fanout consumer
-// and Subscription backing Client.Request()'s reply delivery, scoped to
-// `_reply.<reqInstanceID>.>` on that stream. Held across the network
-// round-trip of consumer creation so concurrent first-callers don't race to
-// create duplicate consumers — a one-time cost paid once per stream.
-func (c *Client) ensureReqReplySub(ctx context.Context, streamID uint32, stream string) (*Subscription, error) {
-	c.reqSubMu.Lock()
-	defer c.reqSubMu.Unlock()
-
-	if sub, ok := c.reqSubs[streamID]; ok {
-		return sub, nil
-	}
-
-	replyFilter := fmt.Sprintf("_reply.%d.>", c.reqInstanceID)
-	replyName := fmt.Sprintf("_reply-%s-%d", stream, c.reqInstanceID)
-
-	seq := c.getConn().NextSeq()
-	// Group = replyName. This consumer must NOT be load-balanced, and it is
-	// not: replyName embeds reqInstanceID, so the group is unique to this
-	// client instance and has exactly one member. The group is filled in
-	// rather than left empty because the broker rejects an empty group (an
-	// empty group in queue mode would otherwise collapse every anonymous
-	// consumer on the stream into one shared queue).
-	frame, err := proto.EncodeCreateConsumer(
-		seq, streamID,
-		[]byte(replyName), []byte(replyName), []byte(replyFilter),
-		1024, AckExplicit, DeliverNew, 0, // Fanout mode, per-instance group
-		30_000, 0, nil,
-	)
-	if err != nil {
-		return nil, err
-	}
-	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
-	if err != nil {
-		return nil, fmt.Errorf("request: create reply consumer send: %w", err)
-	}
-
-	var consumerID uint32
-	if err := c.checkReply(reply); err != nil {
-		if !IsAlreadyExists(err) {
-			return nil, fmt.Errorf("request: create reply consumer: %w", err)
-		}
-		consumerID, err = c.resolveConsumerID(ctx, streamID, replyName)
-		if err != nil {
-			return nil, fmt.Errorf("request: resolve reply consumer: %w", err)
-		}
-	} else {
-		body := reply[proto.HeaderSize:]
-		if len(body) < 8 {
-			return nil, &ArbitroError{Code: ErrCodeInternalError, Message: "request: create reply consumer reply too short"}
-		}
-		consumerID = uint32(proto.RepOkRefSeq(body))
-	}
-
-	sub := &Subscription{
-		client:     c,
-		consumerID: consumerID,
-		ch:         make(chan *Msg, subChanCap),
-		handler:    c.handleRequestReply,
-		closed:     make(chan struct{}),
-	}
-	c.registerSubscription(consumerID, sub, [][]byte{[]byte(replyFilter)})
-	c.activeSubs.Add(1)
-
-	subSeq := c.getConn().NextSeq()
-	subFrame, err := proto.EncodeSubscribe(subSeq, consumerID, [][]byte{[]byte(replyFilter)})
-	if err != nil {
-		return nil, fmt.Errorf("request: encode subscribe: %w", err)
-	}
-	if reply, err := c.getConn().SendExpectReply(ctx, subFrame, subSeq); err != nil {
-		return nil, fmt.Errorf("request: subscribe send: %w", err)
-	} else if err := c.checkReply(reply); err != nil {
-		return nil, fmt.Errorf("request: subscribe reply: %w", err)
-	}
-
-	c.reqSubs[streamID] = sub
-	return sub, nil
-}
-
-// handleRequestReply is the Subscription handler for the per-stream reply
-// consumer created by ensureReqReplySub. It parses the correlation id out
-// of the reply subject and resolves the matching Request() call's channel.
-func (c *Client) handleRequestReply(msg *Msg) {
-	defer msg.Ack()
-
-	subject := msg.Subject()
-	prefix := fmt.Sprintf("_reply.%d.", c.reqInstanceID)
-	if !strings.HasPrefix(subject, prefix) {
-		return
-	}
-	corrID, err := strconv.ParseUint(subject[len(prefix):], 10, 64)
-	if err != nil {
-		return
-	}
-	val, ok := c.reqPending.LoadAndDelete(corrID)
-	if !ok {
-		return
-	}
-	ch := val.(chan []byte)
-	data := make([]byte, len(msg.Data()))
-	copy(data, msg.Data())
-	ch <- data
 }
 
 // ResolveStreamID resolves the stream name to its broker-assigned numeric ID.
