@@ -5,6 +5,44 @@ All notable changes to `arbitro-go` are documented here. Format follows
 as git tags (`vX.Y.Z`); this file is the source of truth for what each tag
 contains.
 
+## [Unreleased]
+
+### Added
+- **`WithAckStoreDir(dir)`** — the ack-store WAL's storage location is now part
+  of the normal option surface. `""` selects the platform default:
+  `$ARBITRO_ACKSTORE_DIR`, else `$XDG_STATE_HOME/arbitro/ackstore` (Linux/BSD),
+  `~/Library/Application Support/arbitro/ackstore` (macOS), or
+  `%LOCALAPPDATA%\arbitro\ackstore` (Windows). Never the cwd, never a temp dir
+  — both silently defeat restart survival, so an unresolvable default is a hard
+  error instead.
+- **`DefaultAckStoreDir()`** — report the resolved path without opening
+  anything; log it at startup.
+- **Single-writer directory lock** — `OpenWAL` takes an OS advisory lock
+  (`flock` on unix, exclusive share-mode open on Windows) on
+  `<dir>/ackstore.lock`. A second client on the same directory now fails with
+  `ErrAckStoreLocked` instead of interleaving frames into one log, which after
+  a restart misattributed records between slots and could skip real work. The
+  kernel releases the lock on process exit, so a crash never wedges the store.
+- **`WAL.Dir()`** — the directory the store actually resolved to.
+- **`ErrAckStoreLocked` / `ErrNoDefaultAckStoreDir`** — matchable with
+  `errors.Is` on the error returned by `Connect`.
+
+### Changed
+- `ackstore.Config.Dir` may now be empty (resolves the default) instead of
+  erroring with "Config.Dir required".
+- An unusable store directory (a regular file, a path under a file, no write
+  permission) now reports the path and the specific problem instead of an
+  opaque `*PathError`.
+- `Connect` validates the ack-store configuration **before** dialling, and
+  closes an already-opened store when the dial fails — previously a transient
+  network error leaked the WAL's file handle (and now its directory lock) for
+  the life of the process, so a retry loop would have hit `ErrAckStoreLocked`.
+
+### Unchanged
+- On-disk WAL format and store semantics. This is configuration only.
+- Default dedup is still the in-memory store; no files appear unless a durable
+  store is explicitly requested.
+
 ## [0.6.2] - 2026-07-18
 
 Reliability and parity release. Brings the Go client's ack-reliability, cron,

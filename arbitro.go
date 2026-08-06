@@ -133,6 +133,15 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		fn(&o)
 	}
 
+	// Fail before dialling on a broken ack-store configuration (missing
+	// directory, unwritable path, directory already held by another process).
+	// WithAckPersistence/WithAckStoreDir open the WAL eagerly and stash the
+	// error here; there is no point establishing a connection we are about to
+	// tear down.
+	if o.ackStoreErr != nil {
+		return nil, o.ackStoreErr
+	}
+
 	dialCfg := conn.Config{
 		Addr:              addr,
 		Timeout:           o.timeout,
@@ -143,6 +152,12 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 
 	c, err := conn.Dial(ctx, dialCfg)
 	if err != nil {
+		// Release the WAL's directory lock; the caller never gets a Client and
+		// so can never Close() it, and a retained lock would make the very next
+		// Connect attempt fail with ErrLocked. Only a store this package opened
+		// is closed — one supplied via WithAckStore stays the caller's to
+		// manage.
+		o.releaseOwnedStore()
 		return nil, err
 	}
 
@@ -164,10 +179,11 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 	// Redelivery dedup (G18) via the ackstore. Default: in-memory store keyed
 	// by (stream, consumer, seq). WithAckPersistence swaps in a durable WAL;
 	// WithoutAckDedup / ARBITRO_GO_DISABLE_SEEN=1 disables it entirely.
-	if o.ackStoreErr != nil {
-		return nil, o.ackStoreErr
-	}
 	if os.Getenv("ARBITRO_GO_DISABLE_SEEN") == "1" {
+		// A WAL this package opened is no longer wanted — close it so its
+		// directory lock is not held for the client's lifetime.
+		o.releaseOwnedStore()
+		client.opts = o // don't leave a closed store reachable via client.opts
 		client.ackStore = nil
 	} else if o.ackDedup {
 		if o.ackStore != nil {

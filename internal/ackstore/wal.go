@@ -44,6 +44,9 @@ type WAL struct {
 	byID    []*slotState          // index by slotID (dense, monotonic)
 	nextID  uint32
 
+	// Single-writer lock on cfg.Dir, released by Close (see lock.go).
+	lock *dirLock
+
 	// TTL sweeper.
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -79,8 +82,27 @@ type slotState struct {
 }
 
 // Config controls WAL behavior. Zero values fall back to defaults.
+//
+// # Storage location
+//
+// Dir is the one setting a deployment almost always needs to override, so it is
+// reachable from the client's normal option surface: arbitro.WithAckStoreDir
+// (or WithAckPersistence). An empty Dir means "resolve at open" —
+// $ARBITRO_ACKSTORE_DIR, else the platform state directory
+// ($XDG_STATE_HOME/arbitro/ackstore, ~/Library/Application Support/arbitro/ackstore,
+// %LOCALAPPDATA%\arbitro\ackstore), else ErrNoDefaultDir. Never the working
+// directory and never a temp dir; see DefaultDir for why.
+//
+// # One writer per directory
+//
+// OpenWAL takes an OS advisory lock on the directory and fails with ErrLocked
+// if another live process already holds it. Point two clients that must run
+// concurrently at two directories. The lock is machine-local: a WAL on a
+// network filesystem shared between hosts is not a supported configuration,
+// and on platforms with no flock/share-mode support (see lock_other.go)
+// single-writer discipline is the caller's responsibility.
 type Config struct {
-	Dir            string        // directory holding ackstore.log
+	Dir            string        // directory holding ackstore.log; "" = platform default
 	TTL            time.Duration // per-entry expiry; 0 = never expire
 	SweepInterval  time.Duration // TTL sweep cadence; default 5s
 	Fsync          bool          // fsync on Sync()/Close()
@@ -115,18 +137,37 @@ var (
 
 const maxNameLen = 65535
 
-// OpenWAL opens (creating if needed) a WAL at cfg.Dir and replays it.
+// OpenWAL opens (creating if needed) a WAL at cfg.Dir — or, when that is empty,
+// at the platform default directory — and replays it.
+//
+// Errors:
+//   - ErrNoDefaultDir: no directory configured and none can be defaulted.
+//   - a "store directory ..." error: the path is a regular file, sits under a
+//     file, or cannot be created / written by this process.
+//   - ErrLocked: another live process already has this directory open.
 func OpenWAL(cfg Config) (*WAL, error) {
 	cfg.withDefaults()
 	if cfg.Dir == "" {
-		return nil, errors.New("ackstore: Config.Dir required")
+		d, err := DefaultDir()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Dir = d
 	}
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("ackstore: mkdir %s: %w", cfg.Dir, err)
+	if err := prepareDir(cfg.Dir); err != nil {
+		return nil, err
+	}
+	// Take the single-writer lock BEFORE touching the log, so a second process
+	// never gets far enough to append an interleaved frame. This also surfaces
+	// "directory not writable" with the path attached.
+	lock, err := acquireDirLock(cfg.Dir)
+	if err != nil {
+		return nil, err
 	}
 	fp := filepath.Join(cfg.Dir, "ackstore.log")
 	f, err := os.OpenFile(fp, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
+		lock.release()
 		return nil, fmt.Errorf("ackstore: open %s: %w", fp, err)
 	}
 
@@ -134,18 +175,21 @@ func OpenWAL(cfg Config) (*WAL, error) {
 		cfg:    cfg,
 		byName: make(map[string]*slotState),
 		stopCh: make(chan struct{}),
+		lock:   lock,
 	}
 	w.writer.f = f
 	w.writer.scratch = make([]byte, 0, 4096)
 
 	if err := w.replay(); err != nil {
 		f.Close()
+		lock.release()
 		return nil, err
 	}
 
 	// Position at end for appends; ensure magic header exists.
 	if err := w.ensureHeader(); err != nil {
 		f.Close()
+		lock.release()
 		return nil, err
 	}
 	w.writer.bw = bufio.NewWriterSize(f, cfg.BufferSize)
@@ -601,8 +645,16 @@ func (w *WAL) Close() error {
 		err = cerr
 	}
 	w.writer.closed = true
+	// Release the single-writer lock only after the log is on disk and closed,
+	// so the directory is never handed to another writer mid-flush.
+	w.lock.release()
 	return err
 }
+
+// Dir reports the directory this WAL resolved to at open — the configured Dir,
+// or the platform default. Log it at startup so an operator can see where the
+// dedup state actually landed.
+func (w *WAL) Dir() string { return w.cfg.Dir }
 
 // --- TTL sweep ---
 

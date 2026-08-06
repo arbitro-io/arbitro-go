@@ -388,6 +388,74 @@ client, _ := arbitro.Connect(ctx, "127.0.0.1:9898",
 )
 ```
 
+## Redelivery Dedup and Where It Is Stored
+
+The broker delivers at-least-once, so a crash between "processed" and "acked"
+can produce a redelivery. The client keeps a dedup set keyed by
+`(stream_name, consumer_name, seq)` so the handler is not re-run for work
+already done.
+
+By default that set is **in memory** — it dedups within one process lifetime and
+is gone on restart. `WithAckStoreDir` swaps in a durable write-ahead log:
+
+```go
+client, _ := arbitro.Connect(ctx, "127.0.0.1:9898",
+    // Where the dedup WAL lives. This is the one setting a deployment
+    // almost always wants to pin.
+    arbitro.WithAckStoreDir("/var/lib/myapp/ackstore"),
+)
+
+// Also set the entry TTL and fsync policy:
+arbitro.WithAckPersistence("/var/lib/myapp/ackstore", time.Hour, true)
+
+// Or turn dedup off entirely (handlers must be idempotent):
+arbitro.WithoutAckDedup()
+```
+
+### Default location
+
+`WithAckStoreDir("")` (and `WithAckPersistence("", ...)`) resolves the directory
+in this order:
+
+1. `$ARBITRO_ACKSTORE_DIR` — operator override, no code change, honoured
+   identically by the Rust, Go and TS clients.
+2. The platform state directory:
+
+   | platform    | default directory                                  |
+   |-------------|----------------------------------------------------|
+   | Linux / BSD | `$XDG_STATE_HOME/arbitro/ackstore`, else `~/.local/state/arbitro/ackstore` |
+   | macOS       | `~/Library/Application Support/arbitro/ackstore`    |
+   | Windows     | `%LOCALAPPDATA%\arbitro\ackstore`                   |
+
+3. Nothing resolvable (no `HOME` / `%LOCALAPPDATA%`, e.g. a bare systemd unit)
+   → `Connect` fails with `arbitro.ErrNoDefaultAckStoreDir`.
+
+There is deliberately **no** cwd-relative and **no** temp-dir fallback. A
+cwd-relative store moves whenever the service is started from a different
+directory, and a temp store is erased on reboot — both silently resurrect the
+duplicate processing the store exists to prevent, while looking healthy. An
+explicit error naming the two fixes is better than either.
+
+`arbitro.DefaultAckStoreDir()` reports the resolved path without opening
+anything; log it at startup.
+
+### One writer per directory
+
+Opening the store takes an OS advisory lock (`flock` on unix, an exclusive
+share-mode open on Windows) on `<dir>/ackstore.lock`. A second `Connect` against
+the same directory fails with `arbitro.ErrAckStoreLocked` instead of
+interleaving writes into one log.
+
+This is enforced rather than documented because two writers do not merely
+corrupt bytes: each numbers slots from its own counter, so after a restart
+replay attributes one process's records to the other's `(stream, consumer)` —
+and a false dedup hit is a message whose handler never runs. The lock is
+released by the kernel when the process exits, so a crash never wedges the
+directory. It does not extend across a network filesystem; a WAL shared between
+hosts is not supported.
+
+Running several clients concurrently? Give each its own directory.
+
 ## Replication
 
 Replication is transparent to the client -- `Replicas` is set at `CreateStream` time. The client publishes normally; the broker handles replication internally.

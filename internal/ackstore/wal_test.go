@@ -36,6 +36,22 @@ func openTestWAL(t *testing.T, dir string, mutate func(*Config)) (*WAL, *fakeClo
 	return w, clk
 }
 
+// simulateCrash releases exactly what a dying process releases — the log file
+// handle and the single-writer directory lock — WITHOUT the graceful flush
+// Close() performs. Only bytes already Sync()ed survive, which is what a real
+// crash leaves on disk. Using this instead of just dropping the reference keeps
+// the "restart" faithful: after a real crash the OS has reclaimed the lock, so
+// the next OpenWAL on that directory must succeed.
+func (w *WAL) simulateCrash() {
+	w.stopOnce.Do(func() { close(w.stopCh) })
+	w.sweeping.Wait()
+	w.writer.mu.Lock()
+	w.writer.closed = true
+	_ = w.writer.f.Close() // deliberately no bw.Flush()
+	w.writer.mu.Unlock()
+	w.lock.release()
+}
+
 func mustSlot(t *testing.T, s Store, stream, consumer string) SlotRef {
 	t.Helper()
 	ref, err := s.Slot(stream, consumer)
@@ -161,9 +177,9 @@ func TestWAL_CrashRecovery(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 	// Simulate crash: DON'T Close (skip flush of any post-Sync writes). But
-	// we synced, so all 100 are durable. Drop the reference.
-	w1.stopOnce.Do(func() { close(w1.stopCh) }) // stop sweeper if any
-	w1.writer.f.Close()                          // release the fd like a crash would
+	// we synced, so all 100 are durable. The OS reclaims the fd and the
+	// directory lock, as it would for a killed process.
+	w1.simulateCrash()
 
 	// Session 2: reopen, verify state survived.
 	w2, _ := openTestWAL(t, dir, func(c *Config) { c.Fsync = true })

@@ -28,6 +28,24 @@ type clientOptions struct {
 	ackStore    ackstore.Store
 	ackStoreErr error // deferred error from WithAckPersistence, checked at Connect
 	ackDedup    bool  // whether to consult the store on delivery
+	// ackStoreOwned marks a store this package opened (WithAckPersistence /
+	// WithAckStoreDir) rather than one the caller handed us. Only an owned
+	// store is closed automatically when a later option supersedes it —
+	// without that, `WithAckStoreDir(d), WithoutAckDedup()` would drop the WAL
+	// reference while its directory lock stayed held for the process lifetime,
+	// and the next Connect on d would fail with ErrLocked for no reason.
+	ackStoreOwned bool
+}
+
+// releaseOwnedStore closes a store this package opened, so a superseding option
+// does not leak its file handle and directory lock.
+func (o *clientOptions) releaseOwnedStore() {
+	if o.ackStore != nil && o.ackStoreOwned {
+		_ = o.ackStore.Close()
+	}
+	o.ackStore = nil
+	o.ackStoreOwned = false
+	o.ackStoreErr = nil
 }
 
 // KeepAlive configures the client heartbeat / dead-connection watchdog.
@@ -64,17 +82,47 @@ func defaultOptions() clientOptions {
 // dedup is enabled.
 func WithAckStore(store ackstore.Store) Option {
 	return func(o *clientOptions) {
+		o.releaseOwnedStore()
 		o.ackStore = store
 		o.ackDedup = store != nil
 	}
+}
+
+// WithAckStoreDir enables durable, restart-surviving redelivery dedup backed by
+// a WAL in dir. This is the option to reach for when the only thing you need to
+// decide is *where the store lives*:
+//
+//	arbitro.Connect(ctx, addr, arbitro.WithAckStoreDir("/var/lib/myapp/ackstore"))
+//
+// Passing "" selects the platform default directory — $ARBITRO_ACKSTORE_DIR,
+// else $XDG_STATE_HOME/arbitro/ackstore (Linux/BSD),
+// ~/Library/Application Support/arbitro/ackstore (macOS), or
+// %LOCALAPPDATA%\arbitro\ackstore (Windows). It is never the working directory
+// and never a temp dir; see ackstore.DefaultDir (re-exported as
+// DefaultAckStoreDir) for the reasoning.
+//
+// Exactly one process may hold a store directory at a time; a second Connect
+// against the same directory fails with ackstore.ErrLocked rather than
+// interleaving writes into one log. Give each client its own directory.
+//
+// Entries never expire and writes are buffered without fsync — the same
+// defaults the Rust client's WalConfig uses. Buffered writes are two orders of
+// magnitude faster and cost only that an OS-level crash may lose the last
+// unflushed records, which degrades to the broker's own at-least-once
+// behaviour. Use WithAckPersistence to set a TTL or turn fsync on.
+func WithAckStoreDir(dir string) Option {
+	return WithAckPersistence(dir, 0, false)
 }
 
 // WithAckPersistence enables durable, restart-surviving redelivery dedup
 // backed by a WAL at dir. ttl bounds how long a recorded ack is remembered
 // (0 = never expire). fsync=true trades throughput for power-loss durability.
 // This is a convenience over WithAckStore(ackstore.OpenWAL(...)).
+//
+// dir == "" selects the platform default directory — see WithAckStoreDir.
 func WithAckPersistence(dir string, ttl time.Duration, fsync bool) Option {
 	return func(o *clientOptions) {
+		o.releaseOwnedStore()
 		w, err := ackstore.OpenWAL(ackstore.Config{
 			Dir:            dir,
 			TTL:            ttl,
@@ -88,16 +136,34 @@ func WithAckPersistence(dir string, ttl time.Duration, fsync bool) Option {
 			return
 		}
 		o.ackStore = w
+		o.ackStoreOwned = true
 		o.ackDedup = true
 	}
 }
+
+// DefaultAckStoreDir reports the directory WithAckStoreDir("") resolves to,
+// without opening anything. Useful for logging the path at startup or for
+// deciding whether the environment can support a durable store at all (it
+// returns ackstore.ErrNoDefaultDir when neither $ARBITRO_ACKSTORE_DIR nor a
+// platform state directory is available).
+func DefaultAckStoreDir() (string, error) { return ackstore.DefaultDir() }
+
+// ErrAckStoreLocked reports that another live process already holds the
+// single-writer lock on the configured ack-store directory. Test for it with
+// errors.Is on the error returned by Connect.
+var ErrAckStoreLocked = ackstore.ErrLocked
+
+// ErrNoDefaultAckStoreDir reports that no ack-store directory was configured
+// and none could be defaulted (no $ARBITRO_ACKSTORE_DIR, no platform state
+// directory). Test for it with errors.Is on the error returned by Connect.
+var ErrNoDefaultAckStoreDir = ackstore.ErrNoDefaultDir
 
 // WithoutAckDedup disables redelivery dedup entirely (pure at-least-once; the
 // user handler may run more than once for a redelivered message). Slightly
 // faster; requires idempotent handlers.
 func WithoutAckDedup() Option {
 	return func(o *clientOptions) {
-		o.ackStore = nil
+		o.releaseOwnedStore()
 		o.ackDedup = false
 	}
 }
