@@ -216,7 +216,7 @@ func (s *Service) dispatch(msg *Msg) {
 				return
 			}
 			if len(resp) > 0 && hasReply {
-				msg.Reply(resp)
+				msg.reply(resp)
 			}
 			msg.Ack()
 		}()

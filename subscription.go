@@ -121,10 +121,18 @@ func (m *Msg) ReplyTo() []byte {
 	return m.frame[m.replyToOff : m.replyToOff+m.replyToLen]
 }
 
-// Reply sends a response to the requester by decoding the reply_to field.
+// reply sends a response to the requester by decoding the reply_to field.
 // Format: [0xFF][stream_id LE u32][subject bytes].
 // No-op if there is no reply_to or the format is invalid.
-func (m *Msg) Reply(payload []byte) {
+//
+// Unexported on purpose: this is how the service dispatcher ships a
+// handler's return value, not something callers drive themselves. Only
+// Service.Request attaches a reply_to, so on any other delivery this can
+// do nothing at all — and a method that silently does nothing is worse
+// than no method. Handlers answer by returning bytes; the framework then
+// pairs the reply with exactly one ack or nack, which hand-rolled
+// request/reply cannot guarantee.
+func (m *Msg) reply(payload []byte) {
 	rt := m.ReplyTo()
 	if len(rt) < 6 || rt[0] != ReplyToMagic {
 		return
