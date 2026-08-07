@@ -955,7 +955,16 @@ func handleStepError(ctx context.Context, cfg *processorConfig, msg *Msg, instan
 		retryMsgID := fmt.Sprintf("wf:%s:%d:%d", instanceID, stepIndex, nextAttempt)
 		retrySubject := fmt.Sprintf("_wf.%s.step.%d", cfg.name, stepIndex)
 		retryTask := encodeTask(instanceID, stepIndex, nextAttempt, taskCtx)
-		_ = cfg.client.Publish(ctx, taskStreamName, retrySubject, retryTask, WithMsgID(retryMsgID))
+		if err := cfg.client.Publish(ctx, taskStreamName, retrySubject, retryTask, WithMsgID(retryMsgID)); err != nil {
+			// Retry not queued — fall back to redelivery so the task is not
+			// lost. Acking here would drop the step silently: the republish
+			// IS the retry, so discarding its error ends the workflow at a
+			// failed step while reporting nothing. Matches the Rust
+			// reference (workflow.rs:1088).
+			msg.Nack()
+			return
+		}
+		// Ack only once the retry is queued.
 		msg.Ack()
 	}
 }

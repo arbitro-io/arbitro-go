@@ -134,6 +134,79 @@ func TestWorkflowSagaCompensation(t *testing.T) {
 	t.Log("saga compensation executed (charge refunded)")
 }
 
+// A permanently failing step must stop at MaxRetries, not retry forever.
+//
+// TestWorkflowSagaCompensation already runs a failing step, but it only waits
+// for compensation and never counts attempts — so an unbounded retry loop
+// passes it. That gap is not hypothetical: the Rust client nacked instead of
+// republishing, which left `attempt` in the payload unchanged, and it spun
+// 24401 times in five seconds while its own suite stayed green. This counts.
+func TestWorkflowMaxRetriesStops(t *testing.T) {
+	client := connectT(t)
+	ctx := context.Background()
+	stream := uniqueName("wf-maxretry")
+
+	_, err := client.CreateStream(ctx, stream, arbitro.StreamConfig{
+		SubjectFilter: stream + ".>",
+		MaxMsgs:       10000,
+		Journal:       arbitro.JournalTolerant,
+	})
+	if err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	defer client.DeleteStream(ctx, stream)
+
+	const maxRetries = 2
+	var attempts atomic.Int32
+	var compensated atomic.Bool
+
+	name := wfName("maxretry")
+	wf, err := client.Workflow(name).
+		Trigger(stream + ".go").
+		TriggerStream(stream).
+		Step("ok", func(step arbitro.StepContext) ([]byte, error) {
+			return []byte("fine"), nil
+		}).
+		Compensate("ok", func(step arbitro.StepContext) error {
+			compensated.Store(true)
+			return nil
+		}).
+		Step("always-fails", func(step arbitro.StepContext) ([]byte, error) {
+			attempts.Add(1)
+			return nil, errors.New("permanent failure")
+		}).
+		MaxRetries(maxRetries).
+		AckWait(500 * time.Millisecond).
+		MaxInflight(5).
+		Start(ctx)
+	if err != nil {
+		t.Fatalf("workflow start: %v", err)
+	}
+	defer wf.Stop(ctx)
+
+	if err := client.Publish(ctx, stream, stream+".go", []byte(`{"id":"R1"}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Sleep rather than waiting for a condition: the assertion is that
+	// something STOPS happening, so the window has to stay open long enough
+	// for a runaway loop to reveal itself.
+	time.Sleep(5 * time.Second)
+
+	// Generous ceiling — the point is bounded, not an exact count. Redelivery
+	// after AckWait can legitimately add a few over the retry budget.
+	const ceiling = maxRetries * 5
+	if got := attempts.Load(); got > ceiling {
+		t.Errorf("step ran %d times with MaxRetries(%d) — retries are unbounded", got, maxRetries)
+	} else {
+		t.Logf("step ran %d times, within ceiling %d", got, ceiling)
+	}
+
+	if !compensated.Load() {
+		t.Error("giving up on the step did not run compensation for the completed one")
+	}
+}
+
 func TestWorkflowManualTrigger(t *testing.T) {
 	client := connectT(t)
 	ctx := context.Background()
