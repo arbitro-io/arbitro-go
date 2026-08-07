@@ -7,7 +7,60 @@ contains.
 
 ## [Unreleased]
 
+### Breaking
+- **Wire error codes corrected.** The `ErrCode*` constants were a generation
+  behind the protocol — `ErrCodeStreamNotFound` was `0x0010` where the broker
+  sends `0x0201`, `ErrCodeIdempotencyDuplicate` was `0x0015` against `0x0206`,
+  and so on across the table. Nothing crashed: `IsNotFound`, `IsAlreadyExists`
+  and `IsDuplicate` compared against numbers the broker stopped emitting and
+  answered `false` forever, so a missing stream read as an unrecognised failure
+  and a duplicate publish was never detected as one. All values now match
+  `arbitro-proto`'s `ErrorCode`, and a test pins the numbers so future drift
+  fails loudly instead of silently.
+
+  If you compare `ErrCode*` constants, no change is needed — they are correct
+  now. If you hardcoded the numeric values, they must be updated.
+- **Six error constants removed**: `ErrCodeStreamFilterOverlap`,
+  `ErrCodeSubjectNotFound`, `ErrCodeConsumerFilterOverlap`,
+  `ErrCodeInvalidSequence`, `ErrCodeMaxInflightReached`, `ErrCodeAckTimeout`.
+  The broker deleted these codes and never sends them; keeping them would leave
+  comparisons that can only ever be false.
+- **Client-side codes moved out of the wire range.** `ErrCodeTimeout` and
+  `ErrCodeInvalidConfig` are now `0xFF01`/`0xFF02` (were `0x00FF`/`0x00FE`) so
+  they cannot collide with a future broker code.
+
+### Fixed
+- **`PauseConsumer` and `ResumeConsumer` never worked.** Both sent
+  `{stream_id, name}`; the wire declares `{consumer_id}`. The broker answers a
+  body it cannot deserialize with `InternalError`, so every pause and resume
+  failed. They now resolve the consumer ID first.
+- **Stopping a cron never worked.** `DeleteCron` sent a JSON body where the
+  wire wants the raw name bytes, so the broker looked up the JSON verbatim as a
+  cron name, missed, and returned `InternalError`.
+- **`StreamExists` returned an error for a stream that does not exist**
+  instead of `false`. "No such stream" is the answer to the question, not a
+  failure to answer it — matching `stream_exists` in the Rust client.
+- **`DeleteMessage` swallowed broker errors** into `(false, nil)`. "Nothing to
+  delete" and "the delete never ran" are different answers, and reporting the
+  second as the first leaves the message deliverable while the caller believes
+  it is gone. Only `StreamNotFound` maps to `false` now.
+- **Workflow: a step whose retry could not be queued was acked anyway.**
+  `handleStepError` re-published the task with `attempt+1` and then discarded
+  the publish error. The republish *is* the retry, so a failed publish silently
+  dropped the step — the workflow stopped at a failed step and reported
+  nothing. A failed republish now nacks, falling back to redelivery.
+- The error predicates now use `errors.As`, so a `%w`-wrapped broker error is
+  still classified correctly.
+
 ### Added
+- **JSON helpers on `StepContext`** — `JSON`, `JSONOrDefault`, `JSONMerge`,
+  `JSONReplace`. The workflow context is opaque bytes, so every step carrying
+  JSON was Unmarshal/Marshal boilerplate around one line of work. `JSONMerge`
+  and `JSONReplace` return `([]byte, error)` to hand straight back from a step:
+  `return step.JSONMerge(...)`. Merge is shallow by design — a deep merge has
+  to guess whether arrays replace or concatenate, and guessing wrong is silent.
+  Uses `encoding/json`; no new dependency. At parity with the Rust client's
+  `StepContext` helpers.
 - **`WithAckStoreDir(dir)`** — the ack-store WAL's storage location is now part
   of the normal option surface. `""` selects the platform default:
   `$ARBITRO_ACKSTORE_DIR`, else `$XDG_STATE_HOME/arbitro/ackstore` (Linux/BSD),
@@ -28,6 +81,12 @@ contains.
   `errors.Is` on the error returned by `Connect`.
 
 ### Changed
+- **`ListConsumers` documents that it returns IDs only.** The reply is a fixed
+  13-byte binary entry (`consumer_id`, `stream_id`, `queue_id`, `paused`) with
+  no name field, so `ConsumerInfo.Name` and `.Filter` come back empty. Match on
+  `ConsumerID`, or use `ConsumerInfo(stream, name)` when the name matters.
+  Behaviour is unchanged — this was previously undocumented, and a name match
+  here silently never succeeded.
 - `ackstore.Config.Dir` may now be empty (resolves the default) instead of
   erroring with "Config.Dir required".
 - An unusable store directory (a regular file, a path under a file, no write
