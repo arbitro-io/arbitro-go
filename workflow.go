@@ -3,6 +3,7 @@ package arbitro
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -25,6 +26,86 @@ type StepContext struct {
 	StepIndex  uint16
 	Attempt    uint8
 	Input      []byte // accumulated context from previous steps
+}
+
+// ── JSON helpers ──────────────────────────────────────────────────────────
+//
+// The workflow context is opaque bytes; the broker never looks inside it.
+// These are parse/encode conveniences for the common case where a workflow
+// carries JSON, so a step is not four lines of Unmarshal/Marshal boilerplate
+// around one line of work. Mirrors arbitro-client-tokio's StepContext JSON
+// helpers (workflow.rs:57). Uses encoding/json — no new dependency.
+
+// JSON decodes the accumulated context into v.
+//
+// Errors on an empty context. Use JSONOrDefault when arriving with no payload
+// is legitimate.
+func (s StepContext) JSON(v any) error {
+	return json.Unmarshal(s.Input, v)
+}
+
+// JSONOrDefault decodes the accumulated context into v, leaving v at its zero
+// value when the context is empty.
+//
+// The empty case is the first step of a workflow triggered without a payload.
+// Without this it is a parse error every caller has to special-case. A
+// non-empty context that does not parse is still an error. (Go's zero value
+// is what the Rust client spells as T::default().)
+func (s StepContext) JSONOrDefault(v any) error {
+	if len(s.Input) == 0 {
+		return nil
+	}
+	return json.Unmarshal(s.Input, v)
+}
+
+// JSONMerge shallow-merges patch into the context and returns the bytes to
+// hand back as the step's result: `return step.JSONMerge(...)`.
+//
+// Shallow on purpose. A deep merge has to guess whether arrays replace or
+// concatenate, and guessing wrong is silent. Nest explicitly when you need it.
+// A context or patch that is valid JSON but not an object is replaced
+// outright — there is nothing to merge into. A context that is not valid JSON
+// at all is an error, not a silent replace.
+func (s StepContext) JSONMerge(patch any) ([]byte, error) {
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.Input) == 0 {
+		return patchBytes, nil
+	}
+
+	var base map[string]json.RawMessage
+	if err := json.Unmarshal(s.Input, &base); err != nil {
+		// Not an object. Distinguish "valid JSON of another shape" from
+		// "malformed": only the first is a legitimate outright replace.
+		var probe any
+		if perr := json.Unmarshal(s.Input, &probe); perr != nil {
+			return nil, perr
+		}
+		return patchBytes, nil
+	}
+	// `null` unmarshals into a nil map without error — also nothing to merge.
+	if base == nil {
+		return patchBytes, nil
+	}
+
+	var p map[string]json.RawMessage
+	if err := json.Unmarshal(patchBytes, &p); err != nil || p == nil {
+		return patchBytes, nil
+	}
+	for k, v := range p {
+		base[k] = v
+	}
+	return json.Marshal(base)
+}
+
+// JSONReplace encodes v as the step's result, discarding the previous context.
+//
+// Without this, "replace" is spelled as a merge over an empty object, which is
+// not the same thing.
+func (s StepContext) JSONReplace(v any) ([]byte, error) {
+	return json.Marshal(v)
 }
 
 // StepOutcome is the return type for suspend step run handlers.

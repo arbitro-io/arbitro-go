@@ -134,6 +134,100 @@ func TestWorkflowSagaCompensation(t *testing.T) {
 	t.Log("saga compensation executed (charge refunded)")
 }
 
+// The JSON helpers have unit coverage, but that only proves they transform
+// bytes correctly in isolation. This proves the transformed bytes actually
+// survive the trip through the broker into the next step — which is the only
+// reason the helpers exist.
+func TestWorkflowJSONHelpersRoundTrip(t *testing.T) {
+	client := connectT(t)
+	ctx := context.Background()
+	stream := uniqueName("wf-json")
+
+	_, err := client.CreateStream(ctx, stream, arbitro.StreamConfig{
+		SubjectFilter: stream + ".>",
+		MaxMsgs:       10000,
+		Journal:       arbitro.JournalTolerant,
+	})
+	if err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	defer client.DeleteStream(ctx, stream)
+
+	type order struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Total  int    `json:"total"`
+	}
+
+	var final atomic.Value // order, as seen by the last step
+	done := make(chan struct{})
+
+	name := wfName("json")
+	wf, err := client.Workflow(name).
+		Trigger(stream + ".new").
+		TriggerStream(stream).
+		Step("price", func(step arbitro.StepContext) ([]byte, error) {
+			var o order
+			// The trigger payload is the context here, so JSON must decode it.
+			if err := step.JSON(&o); err != nil {
+				return nil, err
+			}
+			if o.ID != "A-1" {
+				return nil, errors.New("trigger payload did not reach step 1: " + o.ID)
+			}
+			// Merge: `id` must survive untouched, `total` is added.
+			return step.JSONMerge(map[string]any{"total": 250})
+		}).
+		Step("finish", func(step arbitro.StepContext) ([]byte, error) {
+			var o order
+			if err := step.JSON(&o); err != nil {
+				return nil, err
+			}
+			out, err := step.JSONMerge(map[string]any{"status": "shipped"})
+			if err != nil {
+				return nil, err
+			}
+			var merged order
+			if err := json.Unmarshal(out, &merged); err != nil {
+				return nil, err
+			}
+			final.Store(merged)
+			close(done)
+			return out, nil
+		}).
+		AckWait(5 * time.Second).
+		MaxInflight(5).
+		Start(ctx)
+	if err != nil {
+		t.Fatalf("workflow start: %v", err)
+	}
+	defer wf.Stop(ctx)
+
+	if err := client.Publish(ctx, stream, stream+".new",
+		[]byte(`{"id":"A-1","status":"new"}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for the workflow to reach the last step")
+	}
+
+	got := final.Load().(order)
+	// id came from the trigger, total from step 1's merge, status overwritten
+	// by step 2's — all three prove a different part of the round trip.
+	if got.ID != "A-1" {
+		t.Errorf("merge dropped a key it never touched: id=%q", got.ID)
+	}
+	if got.Total != 250 {
+		t.Errorf("step 1's merge did not reach step 2: total=%d", got.Total)
+	}
+	if got.Status != "shipped" {
+		t.Errorf("patch did not overwrite: status=%q", got.Status)
+	}
+}
+
 // A permanently failing step must stop at MaxRetries, not retry forever.
 //
 // TestWorkflowSagaCompensation already runs a failing step, but it only waits
