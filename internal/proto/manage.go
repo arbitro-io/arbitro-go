@@ -258,18 +258,18 @@ func EncodeConsumerStats(seq uint64, consumerID uint32) ([]byte, error) {
 	return packCold(ActionConsumerStats, seq, consumerStatsPayload{ConsumerID: consumerID})
 }
 
-func EncodePauseConsumer(seq uint64, streamID uint32, name []byte) ([]byte, error) {
-	return packCold(ActionPauseConsumer, seq, getConsumerPayload{
-		StreamID: streamID,
-		Name:     bytesArr(name),
-	})
+// EncodePauseConsumer / EncodeResumeConsumer address the consumer by ID, not
+// by (stream, name). arbitro-proto v2::cold declares both bodies as
+// `{ consumer_id: u32 }` (cold/mod.rs:130), and the broker answers a body it
+// cannot deserialize with InternalError — so sending {stream_id, name} here
+// fails every pause/resume rather than producing a wrong-but-plausible result.
+// Callers resolve the ID with GetConsumer first.
+func EncodePauseConsumer(seq uint64, consumerID uint32) ([]byte, error) {
+	return packCold(ActionPauseConsumer, seq, consumerStatsPayload{ConsumerID: consumerID})
 }
 
-func EncodeResumeConsumer(seq uint64, streamID uint32, name []byte) ([]byte, error) {
-	return packCold(ActionResumeConsumer, seq, getConsumerPayload{
-		StreamID: streamID,
-		Name:     bytesArr(name),
-	})
+func EncodeResumeConsumer(seq uint64, consumerID uint32) ([]byte, error) {
+	return packCold(ActionResumeConsumer, seq, consumerStatsPayload{ConsumerID: consumerID})
 }
 
 // --- Cron ---
@@ -303,8 +303,22 @@ func EncodeCreateCron(seq uint64, name []byte, every, tz string, timeoutMs uint3
 	})
 }
 
+// EncodeDeleteCron carries the cron name as RAW body bytes, not JSON.
+// DeleteCron is the one cron frame that skips serde: arbitro-proto's
+// encode_delete_cron (wire/cron.rs:49) appends the name straight after the
+// header, and the broker reads it back as `&frame[HEADER_SIZE..]`. A JSON
+// body would be looked up verbatim as a cron name, miss, and come back as
+// InternalError.
 func EncodeDeleteCron(seq uint64, name []byte) ([]byte, error) {
-	return packCold(ActionDeleteCron, seq, nameOnlyPayload{Name: bytesArr(name)})
+	frame := make([]byte, HeaderSize+len(name))
+	EncodeHeader(frame, Header{
+		Action: ActionDeleteCron,
+		Flags:  FlagAckReq,
+		MsgLen: uint32(len(name)),
+		Seq:    seq,
+	})
+	copy(frame[HeaderSize:], name)
+	return frame, nil
 }
 
 func EncodeListCrons(seq uint64) ([]byte, error) {

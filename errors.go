@@ -1,30 +1,55 @@
 package arbitro
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Error codes from the broker (wire-level uint16).
+//
+// These MUST track arbitro-proto's `ErrorCode` enum (crates/arbitro-proto/
+// src/error.rs) byte for byte — they are compared against the code the
+// broker puts on the wire, so a stale value silently turns every predicate
+// below into `false`. The high byte is the family: 0x00 protocol, 0x01 auth,
+// 0x02 stream, 0x03 consumer, 0x05 system.
 const (
-	ErrCodeUnknownAction         uint16 = 0x0001
-	ErrCodeBufferTooShort        uint16 = 0x0002
-	ErrCodeInvalidLength         uint16 = 0x0003
-	ErrCodeStreamNotFound        uint16 = 0x0010
-	ErrCodeStreamAlreadyExists   uint16 = 0x0011
-	ErrCodeStreamFull            uint16 = 0x0012
-	ErrCodeStreamFilterOverlap   uint16 = 0x0013
-	ErrCodeSubjectNotFound       uint16 = 0x0014
-	ErrCodeIdempotencyDuplicate  uint16 = 0x0015
-	ErrCodeConsumerNotFound      uint16 = 0x0020
-	ErrCodeConsumerAlreadyExists uint16 = 0x0021
-	ErrCodeConsumerFilterOverlap uint16 = 0x0022
-	ErrCodeInvalidSequence       uint16 = 0x0030
-	ErrCodeMaxInflightReached    uint16 = 0x0031
-	ErrCodeAckTimeout            uint16 = 0x0032
-	ErrCodeAuthRequired          uint16 = 0x0040
-	ErrCodeAuthFailed            uint16 = 0x0041
-	ErrCodeServerShuttingDown    uint16 = 0x0050
-	ErrCodeInternalError         uint16 = 0x0051
-	ErrCodeTimeout               uint16 = 0x00FF // client-side timeout (not from broker)
-	ErrCodeInvalidConfig         uint16 = 0x00FE // client-side ConsumerConfig.Validate() failure (not from broker)
+	// 0x00xx — protocol (the frame itself arrived malformed)
+	ErrCodeUnknownAction     uint16 = 0x0001
+	ErrCodeBufferTooShort    uint16 = 0x0002
+	ErrCodeInvalidLength     uint16 = 0x0003
+	ErrCodeInvalidEntryCount uint16 = 0x0004
+
+	// 0x01xx — auth
+	ErrCodeAuthRequired uint16 = 0x0101
+	ErrCodeAuthFailed   uint16 = 0x0102
+
+	// 0x02xx — stream
+	ErrCodeStreamNotFound      uint16 = 0x0201
+	ErrCodeStreamAlreadyExists uint16 = 0x0202
+	ErrCodeStreamFull          uint16 = 0x0203
+	// The publish carried a msg_id the broker has already stored for this
+	// stream inside idempotency_window_ms. The message was NOT stored, and
+	// the original write is what survives — safe to treat as success.
+	ErrCodeIdempotencyDuplicate uint16 = 0x0206
+
+	// 0x03xx — consumer
+	ErrCodeConsumerNotFound      uint16 = 0x0301
+	ErrCodeConsumerAlreadyExists uint16 = 0x0302
+	// The CreateConsumer request carried an unusable configuration (most
+	// often an empty group, which is mandatory). The consumer was NOT created.
+	ErrCodeInvalidConsumerConfig uint16 = 0x0304
+
+	// 0x05xx — system
+	ErrCodeServerShuttingDown uint16 = 0x0501
+	ErrCodeInternalError      uint16 = 0x0502
+	// The broker recognised the action but has no handler wired in this
+	// build — distinct from "I don't know this code" (ErrCodeUnknownAction).
+	ErrCodeUnimplemented uint16 = 0x0503
+
+	// Client-side only — never seen on the wire. Kept outside every broker
+	// family so they can never collide with a future server code.
+	ErrCodeTimeout       uint16 = 0xFF01 // request deadline elapsed locally
+	ErrCodeInvalidConfig uint16 = 0xFF02 // ConsumerConfig.Validate() failure
 )
 
 // codeMessages maps error codes to human-readable descriptions.
@@ -32,22 +57,21 @@ var codeMessages = map[uint16]string{
 	ErrCodeUnknownAction:         "unknown action",
 	ErrCodeBufferTooShort:        "buffer too short",
 	ErrCodeInvalidLength:         "invalid frame length",
+	ErrCodeInvalidEntryCount:     "invalid entry count",
+	ErrCodeAuthRequired:          "authentication required",
+	ErrCodeAuthFailed:            "authentication failed",
 	ErrCodeStreamNotFound:        "stream not found",
 	ErrCodeStreamAlreadyExists:   "stream already exists",
 	ErrCodeStreamFull:            "stream is full (max messages or bytes reached)",
-	ErrCodeStreamFilterOverlap:   "stream subject filter overlaps with existing stream",
-	ErrCodeSubjectNotFound:       "subject not found",
 	ErrCodeIdempotencyDuplicate:  "duplicate message (idempotency window)",
 	ErrCodeConsumerNotFound:      "consumer not found",
 	ErrCodeConsumerAlreadyExists: "consumer already exists",
-	ErrCodeConsumerFilterOverlap: "consumer filter overlaps with existing consumer",
-	ErrCodeInvalidSequence:       "invalid sequence number",
-	ErrCodeMaxInflightReached:    "max inflight reached",
-	ErrCodeAckTimeout:            "ack timeout exceeded",
-	ErrCodeAuthRequired:          "authentication required",
-	ErrCodeAuthFailed:            "authentication failed",
+	ErrCodeInvalidConsumerConfig: "invalid consumer config",
 	ErrCodeServerShuttingDown:    "server shutting down",
 	ErrCodeInternalError:         "internal server error",
+	ErrCodeUnimplemented:         "action not implemented in this build",
+	ErrCodeTimeout:               "request timed out",
+	ErrCodeInvalidConfig:         "invalid client config",
 }
 
 // ArbitroError represents an error from the broker or client.
@@ -66,26 +90,34 @@ func (e *ArbitroError) Error() string {
 	return fmt.Sprintf("arbitro: error code 0x%04X", e.Code)
 }
 
+// code extracts the wire code from err, unwrapping anything wrapped with
+// %w along the way. A direct type assertion would miss a wrapped error and
+// report the wrong answer, which for these predicates means silently
+// classifying a known broker reply as "not this one".
+func code(err error) (uint16, bool) {
+	var ae *ArbitroError
+	if errors.As(err, &ae) {
+		return ae.Code, true
+	}
+	return 0, false
+}
+
 // IsNotFound returns true if the error is a stream/consumer not found.
 func IsNotFound(err error) bool {
-	if ae, ok := err.(*ArbitroError); ok {
-		return ae.Code == ErrCodeStreamNotFound || ae.Code == ErrCodeConsumerNotFound
-	}
-	return false
+	c, ok := code(err)
+	return ok && (c == ErrCodeStreamNotFound || c == ErrCodeConsumerNotFound)
 }
 
 // IsAlreadyExists returns true if the entity already exists.
 func IsAlreadyExists(err error) bool {
-	if ae, ok := err.(*ArbitroError); ok {
-		return ae.Code == ErrCodeStreamAlreadyExists || ae.Code == ErrCodeConsumerAlreadyExists
-	}
-	return false
+	c, ok := code(err)
+	return ok && (c == ErrCodeStreamAlreadyExists || c == ErrCodeConsumerAlreadyExists)
 }
 
-// IsDuplicate returns true if the publish was rejected as an idempotency duplicate.
+// IsDuplicate returns true if the publish was rejected as an idempotency
+// duplicate. The original write is stored, so callers retrying a publish can
+// treat this as success.
 func IsDuplicate(err error) bool {
-	if ae, ok := err.(*ArbitroError); ok {
-		return ae.Code == ErrCodeIdempotencyDuplicate
-	}
-	return false
+	c, ok := code(err)
+	return ok && c == ErrCodeIdempotencyDuplicate
 }

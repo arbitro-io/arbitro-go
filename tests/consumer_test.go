@@ -26,7 +26,7 @@ func TestConsumerCRUD(t *testing.T) {
 	defer client.DeleteStream(ctx, stream)
 
 	// Create consumer
-	_, err = client.CreateConsumer(ctx, stream, arbitro.ConsumerConfig{
+	consumerID, err := client.CreateConsumer(ctx, stream, arbitro.ConsumerConfig{
 		Name:        "test-consumer",
 		Filter:      stream + ".>",
 		AckPolicy:   arbitro.AckExplicit,
@@ -46,20 +46,23 @@ func TestConsumerCRUD(t *testing.T) {
 		t.Errorf("name: got %q, want %q", info.Name, "test-consumer")
 	}
 
-	// List
+	// List — matched by ID, not name. The ListConsumers reply is a fixed
+	// 13-byte binary entry (consumer_id, stream_id, queue_id, paused) with no
+	// name field, so a name match here can only ever compare "" against
+	// "test-consumer" and fail regardless of whether the consumer is listed.
 	consumers, err := client.ListConsumers(ctx, stream)
 	if err != nil {
 		t.Fatalf("list consumers: %v", err)
 	}
 	found := false
 	for _, c := range consumers {
-		if c.Name == "test-consumer" {
+		if c.ConsumerID == consumerID {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("consumer not found in list")
+		t.Errorf("consumer id %d not found in list of %d", consumerID, len(consumers))
 	}
 
 	// Delete

@@ -141,9 +141,26 @@ func (c *Client) ListStreams(ctx context.Context) ([]StreamInfo, error) {
 func (c *Client) StreamExists(ctx context.Context, name string) (bool, error) {
 	info, err := c.StreamInfo(ctx, name)
 	if err != nil {
+		// "No such stream" is the answer to the question, not a failure to
+		// answer it — same mapping as arbitro-client-tokio's stream_exists
+		// (client.rs:919). Every other wire error still propagates.
+		if IsNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	return info != nil, nil
+}
+
+// resolveConsumerForLifecycle looks up the broker-side consumer ID for
+// (stream, name). PauseConsumer and ResumeConsumer address consumers by ID
+// on the wire, so the name has to be resolved before the frame is built.
+func (c *Client) resolveConsumerForLifecycle(ctx context.Context, stream, name string) (uint32, error) {
+	streamID, err := c.resolveStreamID(ctx, stream)
+	if err != nil {
+		return 0, err
+	}
+	return c.resolveConsumerID(ctx, streamID, name)
 }
 
 // PurgeStream deletes all messages in a stream. Returns message count purged.
@@ -200,11 +217,18 @@ func (c *Client) DeleteMessage(ctx context.Context, stream string, msgSeq uint64
 		return false, err
 	}
 	if err := c.checkReply(reply); err != nil {
-		return false, nil // not found / already deleted
+		// Only a missing stream is a legitimate false. Anything else — a
+		// malformed frame, a shard error — must reach the caller: swallowing
+		// it reports "nothing to delete" for a delete that never ran, and the
+		// message stays deliverable while the caller believes it is gone.
+		if IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	body := reply[proto.HeaderSize:]
 	if len(body) < 8 {
-		return false, nil
+		return false, &ArbitroError{Code: ErrCodeInternalError, Message: "delete message: reply body too short"}
 	}
 	return proto.RepOkRefSeq(body) > 0, nil
 }
@@ -330,6 +354,12 @@ func (c *Client) ConsumerExists(ctx context.Context, stream, name string) (bool,
 
 // ListConsumers returns all consumers for a stream. Pass stream="" to list
 // consumers across every stream (broker semantic: stream_id=0).
+//
+// The returned ConsumerInfo carries IDs only — Name and Filter stay empty.
+// The ListConsumers reply is a fixed 13-byte-per-entry binary body
+// (consumer_id, stream_id, queue_id, paused; dispatch_v2::v2_list_consumers)
+// with no room for names. Use ConsumerInfo(stream, name) when the name
+// matters; match on ConsumerID here.
 func (c *Client) ListConsumers(ctx context.Context, stream string) ([]ConsumerInfo, error) {
 	var streamID uint32
 	if stream != "" {
@@ -378,12 +408,12 @@ func (c *Client) ListConsumers(ctx context.Context, stream string) ([]ConsumerIn
 
 // PauseConsumer pauses delivery to a consumer.
 func (c *Client) PauseConsumer(ctx context.Context, stream, name string) error {
-	streamID, err := c.resolveStreamID(ctx, stream)
+	consumerID, err := c.resolveConsumerForLifecycle(ctx, stream, name)
 	if err != nil {
 		return err
 	}
 	seq := c.getConn().NextSeq()
-	frame, err := proto.EncodePauseConsumer(seq, streamID, []byte(name))
+	frame, err := proto.EncodePauseConsumer(seq, consumerID)
 	if err != nil {
 		return err
 	}
@@ -396,12 +426,12 @@ func (c *Client) PauseConsumer(ctx context.Context, stream, name string) error {
 
 // ResumeConsumer resumes delivery to a paused consumer.
 func (c *Client) ResumeConsumer(ctx context.Context, stream, name string) error {
-	streamID, err := c.resolveStreamID(ctx, stream)
+	consumerID, err := c.resolveConsumerForLifecycle(ctx, stream, name)
 	if err != nil {
 		return err
 	}
 	seq := c.getConn().NextSeq()
-	frame, err := proto.EncodeResumeConsumer(seq, streamID, []byte(name))
+	frame, err := proto.EncodeResumeConsumer(seq, consumerID)
 	if err != nil {
 		return err
 	}

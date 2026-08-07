@@ -4,6 +4,8 @@ package tests
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -25,24 +27,59 @@ func TestDeleteMessage(t *testing.T) {
 	}
 	defer client.DeleteStream(ctx, stream)
 
-	// Publish 3 messages
+	// Publish 3 distinguishable messages.
 	for i := 0; i < 3; i++ {
-		err = client.Publish(ctx, stream, stream+".test", []byte("msg"))
+		err = client.Publish(ctx, stream, stream+".test", []byte(fmt.Sprintf("msg-%d", i)))
 		if err != nil {
 			t.Fatalf("publish %d: %v", i, err)
 		}
 	}
 
-	// Delete message seq 2
-	ok, err := client.DeleteMessage(ctx, stream, 2)
+	// Learn the real sequence numbers instead of assuming the stream owns
+	// 1..3. Sequence numbers are assigned by the SHARD store, which holds
+	// every stream mapped to that shard — so on a broker that has served
+	// other streams, "the second message I published" is not seq 2. Reading
+	// them off a delivery is the only way to name the right entry.
+	seqOf := make(map[string]uint64, 3)
+	probe, err := client.Subscribe(ctx, stream, arbitro.ConsumerConfig{
+		Name:        "del-probe",
+		Filter:      stream + ".>",
+		AckPolicy:   arbitro.AckExplicit,
+		MaxInflight: 100,
+		AckWait:     10 * time.Second,
+	})
 	if err != nil {
-		t.Fatalf("delete message: %v", err)
+		t.Fatalf("subscribe probe: %v", err)
 	}
+	for len(seqOf) < 3 {
+		select {
+		case msg := <-probe.Messages():
+			seqOf[string(msg.Data())] = msg.Seq()
+			msg.Ack()
+		case <-time.After(5 * time.Second):
+			probe.Close()
+			t.Fatalf("probe saw %d/3 messages: %v", len(seqOf), seqOf)
+		}
+	}
+	probe.Close()
+
+	victim, ok := seqOf["msg-1"]
 	if !ok {
-		t.Log("delete returned false (message may have already been consumed)")
+		t.Fatalf("probe never saw msg-1: %v", seqOf)
 	}
 
-	// Subscribe and verify message 2 is skipped
+	deleted, err := client.DeleteMessage(ctx, stream, victim)
+	if err != nil {
+		t.Fatalf("delete message seq %d: %v", victim, err)
+	}
+	if !deleted {
+		t.Fatalf("delete of seq %d reported not-found", victim)
+	}
+
+	// A consumer created AFTER the tombstone reads the stream from the
+	// start. This is the path that skips per-consumer delivery state and
+	// asks the store directly, so it is the one that proves the tombstone
+	// is honoured rather than merely already-acked.
 	sub, err := client.Subscribe(ctx, stream, arbitro.ConsumerConfig{
 		Name:        "del-worker",
 		Filter:      stream + ".>",
@@ -55,26 +92,28 @@ func TestDeleteMessage(t *testing.T) {
 	}
 	defer sub.Close()
 
-	received := 0
+	// Drain for a bounded window rather than stopping at the expected count:
+	// the claim is that a third delivery never arrives, and breaking early
+	// would pass by not having waited.
+	var received []string
 	timeout := time.After(3 * time.Second)
 loop:
 	for {
 		select {
 		case msg := <-sub.Messages():
-			received++
-			// Seq 2 should be skipped (tombstoned)
-			if msg.Seq() == 2 {
-				t.Error("received tombstoned message seq=2")
+			if msg.Seq() == victim {
+				t.Errorf("received tombstoned message seq=%d (%q)", victim, msg.Data())
 			}
+			received = append(received, string(msg.Data()))
 			msg.Ack()
 		case <-timeout:
 			break loop
 		}
 	}
 
-	// Should get 2 messages (1 and 3), not 3
-	if received > 2 {
-		t.Errorf("received %d messages, expected at most 2", received)
+	want := []string{"msg-0", "msg-2"}
+	if !reflect.DeepEqual(received, want) {
+		t.Errorf("received %v, want %v", received, want)
 	}
 }
 
