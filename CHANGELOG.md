@@ -5,7 +5,7 @@ All notable changes to `arbitro-go` are documented here. Format follows
 as git tags (`vX.Y.Z`); this file is the source of truth for what each tag
 contains.
 
-## [Unreleased]
+## [0.7.0] - 2026-08-08
 
 ### Breaking
 - **Wire error codes corrected.** The `ErrCode*` constants were a generation
@@ -130,4 +130,5 @@ frames `0x0A01`–`0x0A04`).
 ### Docs
 - Documented the ack-reliability cold-tier out-of-scope boundary.
 
+[0.7.0]: https://github.com/arbitro-io/arbitro-go/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/arbitro-io/arbitro-go/compare/v0.6.1...v0.6.2
