@@ -3,6 +3,7 @@ package arbitro
 import (
 	"crypto/tls"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/arbitro-io/arbitro-go/internal/ackstore"
@@ -20,6 +21,9 @@ type clientOptions struct {
 	tlsConfig *tls.Config
 	logger    *slog.Logger
 	keepAlive KeepAlive
+	// authToken is the bearer token sent in the handshake. Empty = no Auth
+	// frame. See WithAuthToken.
+	authToken string
 
 	// ackStore backs the client's redelivery-dedup guarantee. Default is an
 	// in-memory store (dedup within the process lifetime). WithAckPersistence
@@ -73,6 +77,9 @@ func defaultOptions() clientOptions {
 		retryInterval: 500 * time.Millisecond,
 		keepAlive:     defaultKeepAlive(),
 		ackDedup:      true, // in-memory dedup on by default
+		// Env fallback so a deployment can turn auth on without a code change.
+		// WithAuthToken overrides it — options are applied after defaults.
+		authToken: os.Getenv("ARBITRO_TOKEN"),
 	}
 }
 
@@ -203,6 +210,22 @@ func WithTLS(cfg *tls.Config) Option {
 // WithLogger sets a structured logger for the client.
 func WithLogger(l *slog.Logger) Option {
 	return func(o *clientOptions) { o.logger = l }
+}
+
+// WithAuthToken sets the bearer token sent once per connection, right after
+// the Hello frame.
+//
+// Unset (and ARBITRO_TOKEN empty) sends no Auth frame at all, which is what a
+// broker with authentication disabled expects.
+//
+// The token is re-sent on every reconnect — it travels in the handshake, so a
+// reconnect cannot silently drop it. Authentication happens once per
+// connection and is never re-checked per message; rotating a credential means
+// reconnecting. A wrong token is terminal: the broker replies AuthFailed and
+// closes, and the client stops reconnecting instead of hammering the broker
+// with a credential that will never work.
+func WithAuthToken(token string) Option {
+	return func(o *clientOptions) { o.authToken = token }
 }
 
 // SubscribeOption configures a subscription.

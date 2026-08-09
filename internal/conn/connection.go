@@ -67,6 +67,14 @@ type Connection struct {
 	lastPongMs        atomic.Int64
 	keepAliveInterval time.Duration
 	keepAliveTimeout  time.Duration
+
+	// authToken is replayed on every handshake, including reconnects. Empty
+	// means no Auth frame at all — what a broker with auth disabled expects.
+	authToken string
+	// authRejected is set once the broker refuses these credentials. Terminal:
+	// only a config change can make a retry succeed, so the reconnect
+	// supervisor must stop instead of hammering the broker.
+	authRejected atomic.Bool
 }
 
 // Config holds connection parameters.
@@ -80,6 +88,18 @@ type Config struct {
 	// KeepAliveTimeout is how long to wait without a Pong before the
 	// connection is declared dead and closed.
 	KeepAliveTimeout time.Duration
+
+	// AuthToken is a bearer token sent once per connection, right after the
+	// Hello frame. Empty sends no Auth frame at all, which is what a broker
+	// with authentication disabled expects.
+	//
+	// Re-sent on every reconnect — it travels in the handshake, so a reconnect
+	// cannot silently drop it. Authentication happens once per connection and
+	// is never re-checked per message; rotating a credential means
+	// reconnecting. A wrong token is terminal: the broker replies AuthFailed
+	// and closes, and the supervisor stops retrying. Capped at 4096 bytes by
+	// the broker.
+	AuthToken string
 
 	// TLS, when non-nil, upgrades the broker connection to TLS (G15). Nil
 	// (the zero value) dials a plain TCP connection, matching prior
@@ -113,6 +133,7 @@ func Dial(ctx context.Context, cfg Config) (*Connection, error) {
 		timeout:           cfg.Timeout,
 		keepAliveInterval: cfg.KeepAliveInterval,
 		keepAliveTimeout:  cfg.KeepAliveTimeout,
+		authToken:         cfg.AuthToken,
 	}
 	c.seq.Store(1)
 	// Initialize the watchdog clock at connect time so a broker that never
@@ -170,6 +191,13 @@ func (c *Connection) heartbeatLoop() {
 			_ = c.Send(frame)
 		}
 	}
+}
+
+// AuthRejected reports whether the broker refused this connection's
+// credentials. Terminal — the reconnect supervisor must stop rather than
+// redial with a token that cannot work.
+func (c *Connection) AuthRejected() bool {
+	return c.authRejected.Load()
 }
 
 // NextSeq returns the next monotonically increasing sequence number.
@@ -258,10 +286,37 @@ func (c *Connection) PendingLen() int {
 	return c.pending.Len()
 }
 
+// sendHello writes the handshake: Hello, then the Auth frame when a token is
+// configured.
+//
+// The only place either frame is written, and it runs inside Dial — which the
+// reconnect supervisor also calls — so a reconnect cannot silently drop
+// authentication.
+//
+// Both frames go out in one Write. The broker's handshake deadline covers them
+// together, and pipelining means the client never waits in between.
+//
+// Nothing is read back: the broker answers only on failure (an error frame,
+// then close). Success is silent, so waiting for a reply would hang forever.
+// readLoop classifies AuthRequired/AuthFailed and marks the failure terminal.
 func (c *Connection) sendHello() error {
-	hello := make([]byte, proto.HelloSize)
-	proto.EncodeHello(hello, proto.DefaultCaps())
-	_, err := c.conn.Write(hello)
+	if c.authToken == "" {
+		hello := make([]byte, proto.HelloSize)
+		proto.EncodeHello(hello, proto.DefaultCaps())
+		_, err := c.conn.Write(hello)
+		return err
+	}
+	tok := []byte(c.authToken)
+	buf := make([]byte, proto.HelloSize+proto.HeaderSize+len(tok))
+	proto.EncodeHello(buf[:proto.HelloSize], proto.DefaultCaps())
+	// Seq 0: the broker consumes this during the handshake, before the
+	// dispatcher (and any request/reply correlation) exists.
+	proto.EncodeHeader(buf[proto.HelloSize:], proto.Header{
+		Action: proto.ActionAuth,
+		MsgLen: uint32(len(tok)),
+	})
+	copy(buf[proto.HelloSize+proto.HeaderSize:], tok)
+	_, err := c.conn.Write(buf)
 	return err
 }
 
@@ -328,6 +383,20 @@ func (c *Connection) readLoop() {
 func (c *Connection) dispatch(hdr proto.Header, frame, body []byte) {
 	switch hdr.Action {
 	case proto.ActionRepOk, proto.ActionRepError:
+		// Auth rejections are terminal and must be classified by CODE, not by
+		// correlation: the broker sends them from the handshake with Seq 0,
+		// which matches no pending request, so Resolve drops them on the
+		// floor. The socket then closes like any other disconnect and the
+		// supervisor redials forever with a credential that can never work —
+		// hammering the broker once per backoff, silently.
+		if hdr.Action == proto.ActionRepError && len(frame) >= proto.HeaderSize+10 {
+			code := binary.LittleEndian.Uint16(frame[proto.HeaderSize+8:])
+			if code == proto.ErrCodeAuthFailed || code == proto.ErrCodeAuthRequired {
+				c.authRejected.Store(true)
+				c.conn.Close()
+				return
+			}
+		}
 		// Resolve pending request by seq
 		c.pending.Resolve(hdr.Seq, frame)
 

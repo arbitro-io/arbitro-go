@@ -1,5 +1,16 @@
 package proto
 
+// Auth error codes, mirrored from the root package's ErrCode table.
+//
+// They live here too because `internal/conn` classifies an auth rejection
+// straight off the wire — it cannot import the root package (that would be an
+// import cycle), and the distinction matters: AuthRequired means "send a
+// token", AuthFailed means "stop retrying, this one will never work".
+const (
+	ErrCodeAuthRequired uint16 = 0x0101
+	ErrCodeAuthFailed   uint16 = 0x0102
+)
+
 // Action codes — V2 binary wire protocol.
 // All values are uint16 LE in the frame header at offset 0.
 const (

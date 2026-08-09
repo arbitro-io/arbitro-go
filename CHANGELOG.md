@@ -5,6 +5,28 @@ All notable changes to `arbitro-go` are documented here. Format follows
 as git tags (`vX.Y.Z`); this file is the source of truth for what each tag
 contains.
 
+## [0.7.1] - 2026-08-08
+
+### Added
+- **`WithAuthToken`** — a bearer token sent once per connection, right after
+  Hello, and again on every reconnect. Falls back to `ARBITRO_TOKEN` so
+  authentication can be enabled without a code change. Unset sends no `Auth`
+  frame at all, which is what a broker with auth disabled expects.
+
+  Authentication happens **once**, at connect. Nothing on the delivery path
+  re-checks it — the TCP connection is the security boundary, so once the peer
+  is established every later frame is from the same peer. The hot path is
+  untouched. Rotating a credential means reconnecting.
+
+  The token rides inside `Dial`, which the reconnect supervisor also calls, so a
+  reconnect cannot silently drop it.
+
+  A wrong token is terminal: `superviseConnection` checks `AuthRejected()`
+  before the reconnect branch and marks the client dead instead of redialing
+  with a credential that will never work. Requires `arbitro-server >= 0.7.1`
+  when the broker has auth disabled — older brokers drop a connection that
+  sends an unsolicited `Auth` frame.
+
 ## [0.7.0] - 2026-08-08
 
 ### Breaking
@@ -130,5 +152,6 @@ frames `0x0A01`–`0x0A04`).
 ### Docs
 - Documented the ack-reliability cold-tier out-of-scope boundary.
 
+[0.7.1]: https://github.com/arbitro-io/arbitro-go/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/arbitro-io/arbitro-go/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/arbitro-io/arbitro-go/compare/v0.6.1...v0.6.2

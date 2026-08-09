@@ -116,6 +116,9 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		KeepAliveInterval: o.keepAlive.Interval,
 		KeepAliveTimeout:  o.keepAlive.Timeout,
 		TLS:               o.tlsConfig,
+		// Explicit option wins; ARBITRO_TOKEN is the deployment fallback so
+		// auth can be switched on without a code change.
+		AuthToken: o.authToken,
 	}
 
 	c, err := conn.Dial(ctx, dialCfg)
@@ -780,6 +783,17 @@ func (c *Client) superviseConnection(cur *conn.Connection) {
 		<-cur.Done()
 
 		if c.closing.Load() {
+			return
+		}
+
+		// A rejected credential is terminal: only a config change can make a
+		// retry succeed, so redialing is pure noise against the broker. Checked
+		// before the reconnect branch so it wins regardless of policy.
+		if cur.AuthRejected() {
+			c.dead.Store(true)
+			c.failAllPending(fmt.Errorf(
+				"arbitro: broker rejected authentication — check WithAuthToken / ARBITRO_TOKEN " +
+					"against the broker ARBITRO_AUTH_TOKEN or ARBITRO_AUTH_USERS"))
 			return
 		}
 
