@@ -61,11 +61,10 @@ func (s *Stream) Publish(ctx context.Context, subject string, payload []byte, op
 // client.publish(stream_id, subject, payload) architecturally — a stack
 // scratch was considered but Connection.Send only enqueues the slice, so
 // the buffer must outlive the call.
-func (s *Stream) PublishAsync(subject string, payload []byte, opts ...PublishOption) {
+func (s *Stream) PublishAsync(subject string, payload []byte, opts ...PublishOption) error {
 	streamID := s.streamID.Load()
 	if streamID == 0 {
-		s.client.PublishAsync(s.name, subject, payload, opts...)
-		return
+		return s.client.PublishAsync(s.name, subject, payload, opts...)
 	}
 
 	var msgID []byte
@@ -104,11 +103,12 @@ func (s *Stream) PublishAsync(subject string, payload []byte, opts ...PublishOpt
 		proto.EncodePublishInto(frame, seq, streamID, subjScratch, msgID, payload, proto.FlagNone)
 	}
 
-	if err := s.client.getConn().Send(frame); err != nil {
+	if err := s.client.getConn().TrySend(frame); err != nil {
 		s.client.publishErrors.Add(1)
-		return
+		return err
 	}
 	s.client.publishesSent.Add(1)
+	return nil
 }
 
 // PublishBatch atomically publishes multiple messages.

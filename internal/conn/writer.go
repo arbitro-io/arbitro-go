@@ -3,11 +3,18 @@ package conn
 import (
 	"bufio"
 	"net"
+	"time"
 )
 
-// writeQueueCap is the capacity of the write channel.
-// Matches the Rust client's WRITE_QUEUE_CAP = 4096.
-const writeQueueCap = 4096
+// DefaultWriteQueueCap is the capacity of the write channel when Config
+// leaves it at zero. Matches the Rust client's WRITE_QUEUE_CAP = 4096.
+const DefaultWriteQueueCap = 4096
+
+// DefaultMaxBlock caps how long Send waits for room when the caller's context
+// carries no deadline of its own. Same role as Kafka's max.block.ms and the
+// Rust client's ClientConfig::max_block: a peer that stopped draining has to
+// surface as an error, not as a publish that never returns.
+const DefaultMaxBlock = 5 * time.Second
 
 // writerBufSize is the bufio.Writer buffer size — large enough to coalesce
 // many small frames into a single syscall.

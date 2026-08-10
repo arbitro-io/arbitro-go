@@ -59,7 +59,7 @@ func (s *Subscription) Close() {
 		// Send Unsubscribe frame
 		seq := s.client.getConn().NextSeq()
 		frame, _ := proto.EncodeUnsubscribe(seq, s.consumerID)
-		_ = s.client.getConn().Send(frame)
+		_ = s.client.getConn().TrySend(frame)
 		s.client.activeSubs.Add(^uint64(0)) // decrement
 		close(s.ch)
 	})
@@ -141,7 +141,7 @@ func (m *Msg) reply(payload []byte) {
 	replySubject := rt[5:]
 	seq := m.client.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, targetStreamID, replySubject, nil, payload, proto.FlagAckReq)
-	_ = m.client.getConn().Send(frame)
+	_ = m.client.getConn().TrySend(frame)
 }
 
 // Seq returns the delivery sequence number.
@@ -184,7 +184,7 @@ func (m *Msg) Nack() {
 	m.acked = true
 	seq := m.client.getConn().NextSeq()
 	frame := proto.EncodeNack(seq, m.consumerID, m.subjectHash, m.seq)
-	_ = m.client.getConn().Send(frame)
+	_ = m.client.getConn().TrySend(frame)
 	m.client.nacksSent.Add(1)
 }
 
@@ -201,7 +201,7 @@ func (m *Msg) NackDelay(d time.Duration) {
 		DelayMs:     uint32(d.Milliseconds()),
 	}
 	frame := proto.EncodeBatchNack(seq, m.consumerID, []proto.NackEntry{entry})
-	_ = m.client.getConn().Send(frame)
+	_ = m.client.getConn().TrySend(frame)
 	m.client.nacksSent.Add(1)
 }
 
@@ -391,7 +391,7 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 			gen = c.ackRelay.Generation(consumerID)
 		}
 		reqSeq := cn.NextSeq()
-		_ = cn.Send(proto.EncodeAckStateReq(reqSeq, consumerID, gen))
+		_ = cn.TrySend(proto.EncodeAckStateReq(reqSeq, consumerID, gen))
 	}
 
 	return sub, nil

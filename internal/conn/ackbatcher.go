@@ -112,14 +112,17 @@ func (ab *AckBatcher) sendBatchAck(consumerID uint32, entries []proto.AckEntry) 
 	if len(entries) == 1 {
 		// Single ack — encode directly (no batch overhead).
 		frame := encodeSingleAckInline(ab.conn.NextSeq(), consumerID, entries[0])
-		if err := ab.conn.Send(frame); err != nil {
+		// TrySend, not Send: a full queue is exactly what recordFailed's hot
+		// tier exists for, and blocking the batcher goroutine would stop
+		// every other consumer's acks too.
+		if err := ab.conn.TrySend(frame); err != nil {
 			ab.recordFailed(consumerID, entries)
 		}
 		return
 	}
 	seq := ab.conn.NextSeq()
 	frame := proto.EncodeBatchAck(seq, consumerID, entries)
-	if err := ab.conn.Send(frame); err != nil {
+	if err := ab.conn.TrySend(frame); err != nil {
 		ab.recordFailed(consumerID, entries)
 	}
 }

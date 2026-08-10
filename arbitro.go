@@ -118,7 +118,9 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		TLS:               o.tlsConfig,
 		// Explicit option wins; ARBITRO_TOKEN is the deployment fallback so
 		// auth can be switched on without a code change.
-		AuthToken: o.authToken,
+		AuthToken:     o.authToken,
+		WriteQueueCap: o.writeQueueCap,
+		MaxBlock:      o.maxBlock,
 	}
 
 	c, err := conn.Dial(ctx, dialCfg)
@@ -268,7 +270,7 @@ func (c *Client) sendAckBatch(consumerID, generation uint32, seqs []uint64) {
 		}
 		seq := conn.NextSeq()
 		frame := proto.EncodeAckBatch(seq, consumerID, generation, 0, seqs[start:end])
-		_ = conn.Send(frame)
+		_ = conn.TrySend(frame)
 	}
 }
 
@@ -338,7 +340,12 @@ func (c *Client) PublishWait(ctx context.Context, stream, subject string, payloa
 
 // PublishAsync sends a message without waiting for confirmation (fire-and-forget).
 // Uses the write channel — no mutex, no syscall on the calling goroutine.
-func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...PublishOption) {
+//
+// Returns conn.ErrQueueFull when the outbound queue has no room. It used to
+// return nothing at all: the error was counted in a metric and discarded, so a
+// caller had no way to learn the message never left. Fire-and-forget means not
+// waiting for the BROKER; it was never a licence to drop work silently.
+func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...PublishOption) error {
 	po := publishOptions{}
 	for _, fn := range opts {
 		fn(&po)
@@ -348,11 +355,12 @@ func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...Pu
 	subj := c.prefixed(subject)
 	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subj), []byte(po.msgID), payload, proto.FlagNone)
-	if err := c.getConn().Send(frame); err != nil {
+	if err := c.getConn().TrySend(frame); err != nil {
 		c.publishErrors.Add(1)
-		return
+		return err
 	}
 	c.publishesSent.Add(1)
+	return nil
 }
 
 // PublishFireAndForget is the fastest publish path — uses a pre-resolved stream ID,
@@ -360,7 +368,7 @@ func (c *Client) PublishAsync(stream, subject string, payload []byte, opts ...Pu
 func (c *Client) PublishFireAndForget(streamID uint32, subject string, payload []byte) error {
 	seq := c.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, streamID, []byte(subject), nil, payload, proto.FlagNone)
-	err := c.getConn().Send(frame)
+	err := c.getConn().TrySend(frame)
 	if err == nil {
 		c.publishesSent.Add(1)
 	} else {
@@ -391,9 +399,9 @@ func (c *Client) encodeBatchEntries(entries []BatchEntry) []proto.BatchEntry {
 // Equivalent to Rust's publish_batch() — fire-and-forget, write-coalesced.
 // Batches larger than publishBatchMax entries are split into multiple frames,
 // matching the Rust client's automatic chunking.
-func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
+func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) error {
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 	streamID, _ := c.streams.get(stream)
 	protoEntries := c.encodeBatchEntries(entries)
@@ -405,12 +413,13 @@ func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) {
 		}
 		seq := c.getConn().NextSeq()
 		frame := proto.EncodePublishBatch(seq, streamID, protoEntries[start:end], proto.FlagNone)
-		if err := c.getConn().Send(frame); err != nil {
+		if err := c.getConn().TrySend(frame); err != nil {
 			c.publishErrors.Add(1)
-			return
+			return err
 		}
 	}
 	c.publishesSent.Add(1)
+	return nil
 }
 
 // PublishBatch atomically publishes multiple messages. Returns the first seq
@@ -463,7 +472,9 @@ func (c *Client) PublishBatch(ctx context.Context, stream string, entries []Batc
 		}
 		s := c.getConn().NextSeq()
 		f := proto.EncodePublishBatch(s, streamID, protoEntries[start:end], proto.FlagNone)
-		if err := c.getConn().Send(f); err != nil {
+		// PublishBatch already carries the caller's ctx, so the tail chunks
+		// wait for room within the same budget instead of failing early.
+		if err := c.getConn().Send(ctx, f); err != nil {
 			c.publishErrors.Add(1)
 			return firstSeq, err
 		}
@@ -875,7 +886,7 @@ func (c *Client) replayAckState(newConn *conn.Connection) {
 			gen := c.ackRelay.Generation(cid)
 			seq := newConn.NextSeq()
 			frame := proto.EncodeAckStateReq(seq, cid, gen)
-			_ = newConn.Send(frame)
+			_ = newConn.TrySend(frame)
 			sent[cid] = struct{}{}
 		}
 	}
@@ -895,7 +906,7 @@ func (c *Client) replayAckState(newConn *conn.Connection) {
 			gen = c.ackRelay.Generation(cid)
 		}
 		seq := newConn.NextSeq()
-		_ = newConn.Send(proto.EncodeAckStateReq(seq, cid, gen))
+		_ = newConn.TrySend(proto.EncodeAckStateReq(seq, cid, gen))
 		return true
 	})
 }

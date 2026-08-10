@@ -25,6 +25,8 @@ type Connection struct {
 
 	// Channel-based writer — replaces writeMu for lock-free publish path.
 	writeCh chan []byte
+	// Wait budget for Send when the caller's context sets no deadline.
+	maxBlock time.Duration
 
 	// Ack batcher — batches individual acks into BatchAck frames.
 	AckBatch *AckBatcher
@@ -105,6 +107,37 @@ type Config struct {
 	// (the zero value) dials a plain TCP connection, matching prior
 	// behavior when WithTLS was never wired into the dial path.
 	TLS *tls.Config
+
+	// WriteQueueCap is how many frames may sit unsent before Send waits and
+	// TrySend reports ErrQueueFull. Zero means DefaultWriteQueueCap.
+	//
+	// This is the client's memory-vs-tolerance dial: a deeper queue absorbs
+	// longer broker stalls at the cost of more frames held in RAM.
+	WriteQueueCap int
+
+	// MaxBlock caps how long Send waits for room when the caller's context
+	// has no deadline. Zero means DefaultMaxBlock; negative means wait
+	// forever, which is the old behaviour and has to be asked for.
+	MaxBlock time.Duration
+}
+
+func writeQueueCapOf(cfg Config) int {
+	if cfg.WriteQueueCap > 0 {
+		return cfg.WriteQueueCap
+	}
+	return DefaultWriteQueueCap
+}
+
+// MaxBlockOf resolves the configured wait budget, so every caller applies the
+// same rule instead of each inventing its own zero-value meaning.
+func MaxBlockOf(cfg Config) time.Duration {
+	if cfg.MaxBlock == 0 {
+		return DefaultMaxBlock
+	}
+	if cfg.MaxBlock < 0 {
+		return 0
+	}
+	return cfg.MaxBlock
 }
 
 // Dial creates a new connection to the broker. If cfg.TLS is set, the
@@ -128,7 +161,8 @@ func Dial(ctx context.Context, cfg Config) (*Connection, error) {
 		addr:              cfg.Addr,
 		conn:              conn,
 		pending:           NewPendingMap(),
-		writeCh:           make(chan []byte, writeQueueCap),
+		writeCh:           make(chan []byte, writeQueueCapOf(cfg)),
+		maxBlock:          MaxBlockOf(cfg),
 		done:              make(chan struct{}),
 		timeout:           cfg.Timeout,
 		keepAliveInterval: cfg.KeepAliveInterval,
@@ -188,7 +222,10 @@ func (c *Connection) heartbeatLoop() {
 			}
 			seq := c.NextSeq()
 			frame := proto.EncodePing(seq)
-			_ = c.Send(frame)
+			// A full queue means traffic IS flowing, which is what a
+			// keepalive is checking for. Blocking the heartbeat goroutine
+			// behind a publish burst would only delay the watchdog.
+			_ = c.TrySend(frame)
 		}
 	}
 }
@@ -205,8 +242,16 @@ func (c *Connection) NextSeq() uint64 {
 	return c.seq.Add(1) - 1
 }
 
-// Send enqueues a frame for writing (non-blocking, lock-free hot path).
-func (c *Connection) Send(frame []byte) error {
+// ErrQueueFull reports that the outbound queue had no room. It is TRANSIENT:
+// the writer is draining and a retry may succeed. Callers must not treat it
+// like a closed connection — that conflation is what turns backpressure into
+// either a silent drop or an infinite retry against a dead socket.
+var ErrQueueFull = errors.New("arbitro: outgoing queue full")
+
+// TrySend enqueues a frame without ever blocking. Returns ErrQueueFull when
+// the queue is full, so the caller decides: retry, drop, slow down, or switch
+// to Send and wait.
+func (c *Connection) TrySend(frame []byte) error {
 	if c.closed.Load() {
 		return errors.New("arbitro: connection closed")
 	}
@@ -214,20 +259,57 @@ func (c *Connection) Send(frame []byte) error {
 	case c.writeCh <- frame:
 		return nil
 	default:
-		// Channel full — apply backpressure (blocking send with close guard).
-		select {
-		case c.writeCh <- frame:
-			return nil
-		case <-c.done:
-			return errors.New("arbitro: connection closed")
+		return ErrQueueFull
+	}
+}
+
+// Send enqueues a frame, waiting for room while the queue is full.
+//
+// The wait is bounded three ways and the caller controls all of them: ctx
+// cancellation, ctx deadline, and maxBlock when the context carries no
+// deadline of its own. It used to be bounded by nothing but the connection
+// dying — a broker that stalled while its socket stayed open blocked the
+// publisher forever, and Publish's own context was never consulted on this
+// path even though it had one.
+func (c *Connection) Send(ctx context.Context, frame []byte) error {
+	if c.closed.Load() {
+		return errors.New("arbitro: connection closed")
+	}
+	// Fast path: room right now, no timer, no extra select arm.
+	select {
+	case c.writeCh <- frame:
+		return nil
+	default:
+	}
+
+	// Only arm a timer when the caller left the deadline to us.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && c.maxBlock > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.maxBlock)
+		defer cancel()
+	}
+
+	select {
+	case c.writeCh <- frame:
+		return nil
+	case <-ctx.Done():
+		// A deadline reached here means the queue never drained, which is
+		// backpressure, not a dead connection.
+		if ctx.Err() == context.DeadlineExceeded {
+			return ErrQueueFull
 		}
+		return ctx.Err()
+	case <-c.done:
+		return errors.New("arbitro: connection closed")
 	}
 }
 
 // SendExpectReply sends a frame and waits for the broker's reply (correlated by seq).
 func (c *Connection) SendExpectReply(ctx context.Context, frame []byte, seq uint64) ([]byte, error) {
 	ch := c.pending.Register(seq)
-	if err := c.Send(frame); err != nil {
+	// The caller already agreed to wait for a reply, so waiting for room is
+	// the smaller of the two costs — and it is bounded by their ctx.
+	if err := c.Send(ctx, frame); err != nil {
 		c.pending.Remove(seq)
 		return nil, err
 	}
@@ -497,7 +579,9 @@ func (c *Connection) handleAckStateRep(body []byte) {
 		}
 		seq := c.NextSeq()
 		frame := proto.EncodeAckBatch(seq, consumerID, generation, 0, seqs[start:end])
-		_ = c.Send(frame)
+		// Dropped acks are recovered by the relay's next sweep; blocking this
+		// path would stall delivery to buy nothing.
+		_ = c.TrySend(frame)
 	}
 }
 

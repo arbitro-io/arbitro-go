@@ -25,6 +25,10 @@ type clientOptions struct {
 	// frame. See WithAuthToken.
 	authToken string
 
+	// writeQueueCap and maxBlock bound the outbound path. See WithWriteQueue.
+	writeQueueCap int
+	maxBlock      time.Duration
+
 	// ackStore backs the client's redelivery-dedup guarantee. Default is an
 	// in-memory store (dedup within the process lifetime). WithAckPersistence
 	// swaps in a durable WAL store that survives process restart. Nil disables
@@ -184,6 +188,27 @@ func WithKeepAlive(interval, timeout time.Duration) Option {
 }
 
 // WithTimeout sets the default timeout for management operations.
+// WithWriteQueue sets the outbound queue depth and the wait budget.
+//
+// cap is how many frames may sit unsent before the queue is full. It is the
+// memory-vs-tolerance dial: deeper absorbs longer broker stalls at the cost
+// of more frames held in RAM. Zero keeps conn.DefaultWriteQueueCap (4096).
+//
+// maxBlock caps how long a blocking Publish waits for room when its context
+// carries no deadline of its own, after which it returns conn.ErrQueueFull.
+// Same role as Kafka's max.block.ms. Zero keeps conn.DefaultMaxBlock (5s);
+// negative means wait forever, which has to be asked for explicitly because
+// it is how a stalled broker turns into a hung publisher.
+//
+// Neither value affects PublishAsync / PublishFireAndForget: those never
+// wait, and report conn.ErrQueueFull the moment the queue is full.
+func WithWriteQueue(cap int, maxBlock time.Duration) Option {
+	return func(o *clientOptions) {
+		o.writeQueueCap = cap
+		o.maxBlock = maxBlock
+	}
+}
+
 func WithTimeout(d time.Duration) Option {
 	return func(o *clientOptions) { o.timeout = d }
 }

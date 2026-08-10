@@ -154,7 +154,7 @@ func (s *Service) Send(ctx context.Context, target, method string, payload []byt
 	subject := []byte(svcPrefix + target + methodInfix + method)
 	seq := s.client.getConn().NextSeq()
 	frame := proto.EncodePublish(seq, targetStreamID, subject, nil, payload, proto.FlagAckReq)
-	return s.client.getConn().Send(frame)
+	return s.client.getConn().TrySend(frame)
 }
 
 // Close shuts down the service and cancels pending requests.

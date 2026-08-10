@@ -231,7 +231,7 @@ func (c *Client) runCronHandler(entry *cronEntry, name string, fireTimeMs, fireC
 	ackSeq := c.getConn().NextSeq()
 	ackFrame, ackErr := proto.EncodeCronAck(ackSeq, []byte(name), ackOK)
 	if ackErr == nil {
-		_ = c.getConn().Send(ackFrame)
+		_ = c.getConn().TrySend(ackFrame)
 	}
 }
 
