@@ -3,7 +3,27 @@ package arbitro
 import (
 	"errors"
 	"fmt"
+
+	"github.com/arbitro-io/arbitro-go/internal/conn"
 )
+
+// ErrQueueFull reports that the outbound queue had no room: PublishAsync and
+// friends found it full, or a blocking Publish exhausted its wait budget.
+//
+// TRANSIENT. The writer is draining and a retry may succeed. That is the
+// whole distinction this alias exists to make usable — the sentinel itself
+// lives in internal/conn, which nothing outside this module can import, so
+// without it a caller had a documented contract and no way to test for it:
+//
+//	if err := client.PublishAsync(stream, subj, payload); err != nil {
+//	    if errors.Is(err, arbitro.ErrQueueFull) {
+//	        // back off and retry — the message was NOT sent
+//	    }
+//	    // anything else is terminal for this connection
+//	}
+//
+// Same alias pattern as ErrAckStoreLocked in options.go.
+var ErrQueueFull = conn.ErrQueueFull
 
 // Error codes from the broker (wire-level uint16).
 //
