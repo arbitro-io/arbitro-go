@@ -194,14 +194,14 @@ func WithKeepAlive(interval, timeout time.Duration) Option {
 // of more frames held in RAM. Zero keeps conn.DefaultWriteQueueCap (4096).
 //
 // maxBlock caps how long a blocking Publish waits for room when its context
-// carries no deadline of its own, after which it returns conn.ErrQueueFull —
+// carries no deadline of its own, after which it returns ErrQueueFull —
 // transient backpressure, not a closed connection; the caller may retry. Same
 // role as Kafka's max.block.ms. Zero keeps conn.DefaultMaxBlock (5s);
 // negative means wait forever, which has to be asked for explicitly because
 // it is how a stalled broker turns into a hung publisher.
 //
 // Neither value affects PublishAsync / PublishFireAndForget: those never
-// wait, and report the same transient conn.ErrQueueFull the moment the queue
+// wait, and report the same transient ErrQueueFull the moment the queue
 // is full.
 func WithWriteQueue(cap int, maxBlock time.Duration) Option {
 	return func(o *clientOptions) {

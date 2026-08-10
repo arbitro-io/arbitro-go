@@ -405,10 +405,13 @@ client, _ := arbitro.Connect(ctx, "127.0.0.1:9898",
 err := client.Publish(ctx, "orders", "orders.created", payload)
 if err != nil {
     // A deadline reached while the queue was still full surfaces here as
-    // "arbitro: outgoing queue full" (conn.ErrQueueFull) -- transient
+    // arbitro.ErrQueueFull ("arbitro: outgoing queue full") -- transient
     // backpressure, not a dead connection. Retry, shed the message, or
     // slow the producer. A closed connection is a different, terminal
     // error and must not be handled the same way.
+    if errors.Is(err, arbitro.ErrQueueFull) {
+        // back off and retry -- the message was NOT sent
+    }
 }
 ```
 
@@ -422,12 +425,17 @@ if err != nil {
   Zero keeps the default (5s). A negative value restores the old
   wait-forever behaviour, but it has to be asked for explicitly -- that is
   how a stalled broker used to turn into a hung publisher.
-- `Connection.TrySend` never blocks at all: it returns `ErrQueueFull`
+- `Connection.TrySend` never blocks at all: it returns `arbitro.ErrQueueFull`
   immediately if there is no room, and deliberately takes no
   `context.Context` -- it cannot wait, so there is nothing to cancel.
   `PublishAsync`, `Stream.PublishAsync`, and `PublishBatchAsync` use it
   internally, which is why they now return an `error` (see migration note
   below).
+- `arbitro.ErrQueueFull` is the sentinel to put in `errors.Is`. The queue lives
+  in `internal/conn`, which nothing outside this module can import, so the
+  package re-exports the sentinel at the root -- same pattern as
+  `arbitro.ErrAckStoreLocked`. It is the one error on these paths that means
+  *retry*; everything else is terminal for the connection.
 
 ### Migrating from before this change (breaking)
 

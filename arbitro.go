@@ -341,7 +341,8 @@ func (c *Client) PublishWait(ctx context.Context, stream, subject string, payloa
 // PublishAsync sends a message without waiting for confirmation (fire-and-forget).
 // Uses the write channel — no mutex, no syscall on the calling goroutine.
 //
-// Returns conn.ErrQueueFull when the outbound queue has no room. It used to
+// Returns ErrQueueFull when the outbound queue has no room — transient
+// backpressure, not a dead connection; test for it with errors.Is. It used to
 // return nothing at all: the error was counted in a metric and discarded, so a
 // caller had no way to learn the message never left. Fire-and-forget means not
 // waiting for the BROKER; it was never a licence to drop work silently.
@@ -399,6 +400,11 @@ func (c *Client) encodeBatchEntries(entries []BatchEntry) []proto.BatchEntry {
 // Equivalent to Rust's publish_batch() — fire-and-forget, write-coalesced.
 // Batches larger than publishBatchMax entries are split into multiple frames,
 // matching the Rust client's automatic chunking.
+//
+// Returns ErrQueueFull when the outbound queue has no room — transient
+// backpressure, not a dead connection; test for it with errors.Is. A chunked
+// batch stops at the first chunk that cannot be enqueued, so earlier chunks
+// may already be on their way.
 func (c *Client) PublishBatchAsync(stream string, entries []BatchEntry) error {
 	if len(entries) == 0 {
 		return nil

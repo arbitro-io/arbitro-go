@@ -16,15 +16,23 @@ contains.
   ignored the return value.
 
 ### Added
+- **`arbitro.ErrQueueFull`** -- the sentinel for "the outbound queue had no
+  room", exported at the package root so `errors.Is` has something to test
+  against. The error itself is returned from `internal/conn`, which nothing
+  outside this module can import, so the contract was documented and
+  untestable at the same time. Same re-export pattern as
+  `arbitro.ErrAckStoreLocked`. It is **transient** -- the writer is draining
+  and a retry may succeed -- which is exactly what it exists to distinguish
+  from a closed connection.
 - **`WithWriteQueue(cap, maxBlock)`** -- sets the outbound queue depth and how
   long a blocking `Send` (used by `Publish`, request/reply, and the tail
   chunks of `PublishBatch`) waits for room before giving up. `cap` is the
   memory-vs-tolerance dial; `maxBlock` bounds the wait when the caller's
   `context.Context` carries no deadline of its own, after which it returns
-  `ErrQueueFull` (a negative value restores the old wait-forever behaviour).
-  Mirrors the Rust client's `write_queue_capacity` + `max_block`.
+  `arbitro.ErrQueueFull` (a negative value restores the old wait-forever
+  behaviour). Mirrors the Rust client's `write_queue_capacity` + `max_block`.
 - **`Connection.TrySend`** -- enqueues a frame without ever blocking; returns
-  `ErrQueueFull` immediately if there is no room. Takes no
+  `arbitro.ErrQueueFull` immediately if there is no room. Takes no
   `context.Context` by design: it cannot wait, so there is nothing to
   cancel. `PublishAsync`, `Stream.PublishAsync`, and `PublishBatchAsync` use
   it internally.
@@ -40,7 +48,7 @@ contains.
   own `ctx` was never consulted on this path even though `Publish` had one.
   `Send` is now bounded by ctx cancellation, ctx deadline, or `MaxBlock`
   (see `WithWriteQueue`) when the context sets no deadline of its own. A
-  deadline reached while still waiting for room returns `ErrQueueFull`,
+  deadline reached while still waiting for room returns `arbitro.ErrQueueFull`,
   which is transient backpressure, not a dead connection -- the two must
   not be conflated.
 

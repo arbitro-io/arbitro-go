@@ -61,6 +61,9 @@ func (s *Stream) Publish(ctx context.Context, subject string, payload []byte, op
 // client.publish(stream_id, subject, payload) architecturally — a stack
 // scratch was considered but Connection.Send only enqueues the slice, so
 // the buffer must outlive the call.
+//
+// Returns ErrQueueFull when the outbound queue has no room — transient
+// backpressure, not a dead connection; test for it with errors.Is.
 func (s *Stream) PublishAsync(subject string, payload []byte, opts ...PublishOption) error {
 	streamID := s.streamID.Load()
 	if streamID == 0 {
