@@ -57,11 +57,29 @@ func TestMaxInflight(t *testing.T) {
 		}
 	}()
 
-	// Wait a bit and check we don't exceed inflight limit
-	time.Sleep(500 * time.Millisecond)
-	r := received.Load()
-	if r > 3 {
-		t.Errorf("received %d messages with MaxInflight=3, expected <= 3", r)
+	// Exactly MaxInflight, not "at most". `<= 3` is satisfied by 0, so a
+	// delivery path that stopped working entirely passed this test — it could
+	// not tell an enforced cap apart from no delivery at all. 10 were
+	// published, none are acked, so 3 is the only correct answer. The sibling
+	// clients assert the same equality (Rust stage00, C stage 0).
+	//
+	// Waiting for the cap to fill rather than sleeping a fixed 500ms: that
+	// sleep was a race, and it loses often enough to matter — a run of this
+	// test observed 0 delivered inside the window and would have failed an
+	// exact assertion for a reason that has nothing to do with the cap.
+	deadline := time.Now().Add(5 * time.Second)
+	for received.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if r := received.Load(); r != 3 {
+		t.Fatalf("received %d messages with MaxInflight=3, expected exactly 3", r)
+	}
+
+	// Still 3 after the queue has had time to push a fourth: the cap holds,
+	// it did not merely lag.
+	time.Sleep(300 * time.Millisecond)
+	if r := received.Load(); r != 3 {
+		t.Errorf("cap exceeded: %d delivered with MaxInflight=3 and nothing acked", r)
 	}
 }
 
@@ -104,19 +122,30 @@ func TestSubjectInflightLimits(t *testing.T) {
 		}
 	}
 
-	// Should get at most 1 at a time for priority subject
+	// The cap is 1 in flight for this subject, so with nothing acked the
+	// second message must not arrive. Both branches of this check used to be
+	// empty — whether a second showed up or not, the test did exactly nothing,
+	// so the only way it could fail was the first message never arriving. It
+	// asserted that delivery works, not that the cap does.
 	select {
 	case msg := <-sub.Messages():
-		// Got one — now wait briefly and confirm no more arrive without ack
 		time.Sleep(200 * time.Millisecond)
 		select {
-		case <-sub.Messages():
-			// Might get a second if broker processes before we check,
-			// but the constraint is on in-flight without ack
+		case extra := <-sub.Messages():
+			t.Errorf("second message delivered (seq %d) while the first was "+
+				"unacked and maxSubjectInflight is 1", extra.Seq())
 		default:
-			// Good — backpressure working
 		}
 		msg.Ack()
+
+		// And it must resume once the slot frees, otherwise "nothing else
+		// arrives" would also be satisfied by a cap that never releases.
+		select {
+		case next := <-sub.Messages():
+			next.Ack()
+		case <-time.After(5 * time.Second):
+			t.Fatal("no delivery after acking — the subject slot never released")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for first priority message")
 	}
