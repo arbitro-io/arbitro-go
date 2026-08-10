@@ -250,7 +250,9 @@ var ErrQueueFull = errors.New("arbitro: outgoing queue full")
 
 // TrySend enqueues a frame without ever blocking. Returns ErrQueueFull when
 // the queue is full, so the caller decides: retry, drop, slow down, or switch
-// to Send and wait.
+// to Send and wait. ErrQueueFull is transient — the connection is alive and
+// draining, not dead. A closed connection reports a distinct, terminal error
+// instead; the two must never be conflated.
 func (c *Connection) TrySend(frame []byte) error {
 	if c.closed.Load() {
 		return errors.New("arbitro: connection closed")
@@ -271,6 +273,10 @@ func (c *Connection) TrySend(frame []byte) error {
 // dying — a broker that stalled while its socket stayed open blocked the
 // publisher forever, and Publish's own context was never consulted on this
 // path even though it had one.
+//
+// A deadline reached while still waiting for room returns ErrQueueFull —
+// transient, safe to retry. A closed connection returns a distinct, terminal
+// error; the two must never be conflated.
 func (c *Connection) Send(ctx context.Context, frame []byte) error {
 	if c.closed.Load() {
 		return errors.New("arbitro: connection closed")

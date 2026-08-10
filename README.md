@@ -76,12 +76,13 @@ err = client.Publish(ctx, "orders", "orders.created", payload,
     arbitro.WithMsgID("order-abc-123"),
 )
 
-// Async -- fire-and-forget, returns immediately
-client.PublishAsync("orders", "orders.created", payload)
+// Async -- fire-and-forget, returns immediately. err is non-nil only when the
+// outbound queue had no room to take the frame (see "Bounded Backpressure").
+err = client.PublishAsync("orders", "orders.created", payload)
 
 // Fire-and-forget with pre-resolved stream ID (fastest path)
 streamID, _ := client.ResolveStreamID(ctx, "orders")
-client.PublishFireAndForget(streamID, "orders.created", payload)
+err = client.PublishFireAndForget(streamID, "orders.created", payload)
 
 // Batch -- atomic, returns first seq
 firstSeq, err := client.PublishBatch(ctx, "orders", []arbitro.BatchEntry{
@@ -90,7 +91,7 @@ firstSeq, err := client.PublishBatch(ctx, "orders", []arbitro.BatchEntry{
 })
 
 // Batch fire-and-forget (write-coalesced, highest throughput)
-client.PublishBatchAsync("orders", entries)
+err = client.PublishBatchAsync("orders", entries)
 
 // Delayed -- delivered after duration
 err = client.PublishDelayed(ctx, "orders", "orders.reminder", payload, 30*time.Second)
@@ -389,6 +390,64 @@ client, _ := arbitro.Connect(ctx, "127.0.0.1:9898",
 )
 ```
 
+## Bounded Backpressure (Write Queue)
+
+Every connection has one outbound queue feeding the TCP socket. `WithWriteQueue`
+sets its depth and how long a blocking send will wait for room:
+
+```go
+client, _ := arbitro.Connect(ctx, "127.0.0.1:9898",
+    // Absorb up to 8192 unsent frames; give a blocking Publish at most
+    // 2 seconds to find room before giving up.
+    arbitro.WithWriteQueue(8192, 2*time.Second),
+)
+
+err := client.Publish(ctx, "orders", "orders.created", payload)
+if err != nil {
+    // A deadline reached while the queue was still full surfaces here as
+    // "arbitro: outgoing queue full" (conn.ErrQueueFull) -- transient
+    // backpressure, not a dead connection. Retry, shed the message, or
+    // slow the producer. A closed connection is a different, terminal
+    // error and must not be handled the same way.
+}
+```
+
+- `cap` (first argument) is the memory-vs-tolerance dial: a deeper queue rides
+  out longer broker stalls at the cost of more frames held in RAM. Zero keeps
+  the default (4096).
+- `maxBlock` (second argument) bounds how long a blocking `Send` -- used by
+  `Publish`, request/reply, and the tail chunks of `PublishBatch` -- waits for
+  room when the caller's `context.Context` carries no deadline of its own; the
+  caller's own `ctx` deadline or cancellation always wins if it fires first.
+  Zero keeps the default (5s). A negative value restores the old
+  wait-forever behaviour, but it has to be asked for explicitly -- that is
+  how a stalled broker used to turn into a hung publisher.
+- `Connection.TrySend` never blocks at all: it returns `ErrQueueFull`
+  immediately if there is no room, and deliberately takes no
+  `context.Context` -- it cannot wait, so there is nothing to cancel.
+  `PublishAsync`, `Stream.PublishAsync`, and `PublishBatchAsync` use it
+  internally, which is why they now return an `error` (see migration note
+  below).
+
+### Migrating from before this change (breaking)
+
+`Client.PublishAsync`, `Stream.PublishAsync`, and `Client.PublishBatchAsync`
+now return `error`. They used to return nothing -- a failed enqueue was fed
+into a metric counter and discarded, so a caller had no way to learn a
+message never left. Fire-and-forget means not waiting for the **broker**; it
+was never a license to drop work silently. Update call sites that ignored the
+return value:
+
+```go
+// before
+client.PublishAsync("orders", "orders.created", payload)
+
+// after
+if err := client.PublishAsync("orders", "orders.created", payload); err != nil {
+    // queue full (transient, see above) -- retry, shed, or slow down
+}
+```
+
 ## Redelivery Dedup and Where It Is Stored
 
 The broker delivers at-least-once, so a crash between "processed" and "acked"
@@ -460,6 +519,25 @@ Running several clients concurrently? Give each its own directory.
 ## Replication
 
 Replication is transparent to the client -- `Replicas` is set at `CreateStream` time. The client publishes normally; the broker handles replication internally.
+
+## Testing
+
+```bash
+go test ./...
+```
+
+Everything is unit-only and needs no infrastructure, with one exception:
+`replay_backlog_test.go` is the first integration test in this repo -- the Go
+twin of the Rust replay bench and of the TypeScript/C replay tests. It fills
+several streams as fast as the client will take the work, then reads
+everything back, to catch a published tail the client accepted but never
+sent. It skips automatically when no broker answers at `127.0.0.1:9898`, so
+`go test ./...` stays runnable with no setup. Point it at a broker running
+elsewhere with `ARBITRO_ADDR`:
+
+```bash
+ARBITRO_ADDR=127.0.0.1:9898 go test ./...
+```
 
 ## License
 

@@ -5,6 +5,45 @@ All notable changes to `arbitro-go` are documented here. Format follows
 as git tags (`vX.Y.Z`); this file is the source of truth for what each tag
 contains.
 
+## [Unreleased]
+
+### Breaking
+- **`Client.PublishAsync`, `Stream.PublishAsync`, and `Client.PublishBatchAsync`
+  now return `error`.** They used to return nothing -- a failed enqueue was
+  counted in a metric and discarded, so a caller had no way to learn a
+  message never left. Fire-and-forget means not waiting for the **broker**;
+  it was never a license to drop work silently. Update call sites that
+  ignored the return value.
+
+### Added
+- **`WithWriteQueue(cap, maxBlock)`** -- sets the outbound queue depth and how
+  long a blocking `Send` (used by `Publish`, request/reply, and the tail
+  chunks of `PublishBatch`) waits for room before giving up. `cap` is the
+  memory-vs-tolerance dial; `maxBlock` bounds the wait when the caller's
+  `context.Context` carries no deadline of its own, after which it returns
+  `ErrQueueFull` (a negative value restores the old wait-forever behaviour).
+  Mirrors the Rust client's `write_queue_capacity` + `max_block`.
+- **`Connection.TrySend`** -- enqueues a frame without ever blocking; returns
+  `ErrQueueFull` immediately if there is no room. Takes no
+  `context.Context` by design: it cannot wait, so there is nothing to
+  cancel. `PublishAsync`, `Stream.PublishAsync`, and `PublishBatchAsync` use
+  it internally.
+- First integration test (`replay_backlog_test.go`) -- the Go twin of the
+  Rust replay bench and of the TypeScript/C replay tests. Skips
+  automatically unless a broker is reachable at `127.0.0.1:9898`; point it
+  elsewhere with `ARBITRO_ADDR`.
+
+### Fixed
+- **`Connection.Send` could block forever.** It waited on the write channel
+  with only the connection dying as an escape, so a broker that stalled
+  while its socket stayed open held the publisher forever -- the caller's
+  own `ctx` was never consulted on this path even though `Publish` had one.
+  `Send` is now bounded by ctx cancellation, ctx deadline, or `MaxBlock`
+  (see `WithWriteQueue`) when the context sets no deadline of its own. A
+  deadline reached while still waiting for room returns `ErrQueueFull`,
+  which is transient backpressure, not a dead connection -- the two must
+  not be conflated.
+
 ## [0.7.1] - 2026-08-08
 
 ### Added
@@ -152,6 +191,7 @@ frames `0x0A01`–`0x0A04`).
 ### Docs
 - Documented the ack-reliability cold-tier out-of-scope boundary.
 
+[Unreleased]: https://github.com/arbitro-io/arbitro-go/compare/v0.7.1...HEAD
 [0.7.1]: https://github.com/arbitro-io/arbitro-go/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/arbitro-io/arbitro-go/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/arbitro-io/arbitro-go/compare/v0.6.1...v0.6.2
