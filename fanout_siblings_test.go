@@ -3,222 +3,467 @@ package arbitro
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
 
-// Several filtered subscriptions sharing ONE consumer over ONE connection.
+// One consumer, several filtered subscriptions — same connection and across
+// connections. Plus: may two consumers share a filter, or a name?
 //
-// The broker collapses that into a single wire copy per (connection,
-// consumer) and stamps it with whichever subscription won the round; the
-// client is what turns it back into one delivery per matching filter. Before
-// the registry was keyed by subscription this topology was unreachable from
-// Go at all — the dispatch table was keyed by consumer, so the second
-// subscribe overwrote the first.
+// Ported from the Rust suite, which is the source of truth for what the
+// broker actually does: arbitro-e2e/tests/one_consumer_many_filters.rs. Same
+// fixture, same shapes, same expected counts, so a divergence between the
+// clients shows up as a disagreement between two suites rather than as a
+// silence in one of them.
 //
-// The Rust twin is arbitro-e2e/tests/one_consumer_many_filters.rs.
+// The broker sends ONE wire copy per (connection, consumer) and stamps it
+// with whichever subscription won the round; the client hands it to every
+// sibling whose filter accepts the subject. So per consumer the wire carries
+// 6 copies and the handles see 11 deliveries — the gap is what the collapse
+// buys, measured rather than argued.
 //
 // Skipped unless a broker is reachable; point it elsewhere with ARBITRO_ADDR.
 
-// unique keeps parallel runs and repeated local runs from colliding on
-// durable stream and consumer names.
+const (
+	fanOrders   = 3
+	fanPayments = 2
+	fanAudit    = 1
+	fanTotal    = fanOrders + fanPayments + fanAudit
+	// Per consumer: its own copy for orders.*, for payments.*, and the
+	// catch-all sees everything.
+	fanPerConsumer = fanOrders + fanPayments + fanTotal
+)
+
+// unique keeps parallel and repeated local runs from colliding on durable
+// stream and consumer names.
 func unique(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 }
 
-// collect drains up to want messages, or gives up after the deadline.
-// Returns what it got so a shortfall is reported as a count, not a hang.
-func collect(sub *Subscription, want int, timeout time.Duration) []*Msg {
-	got := make([]*Msg, 0, want)
-	deadline := time.After(timeout)
-	for len(got) < want {
+// wideConsumer is the shared shape: one consumer, wide open, fanout. Every
+// narrowing is subscription-side.
+func wideConsumer(name string) ConsumerConfig {
+	return ConsumerConfig{
+		Name:        name,
+		Fanout:      true,
+		AckPolicy:   1, // Explicit
+		MaxInflight: 1000,
+		AckWait:     30 * time.Second,
+	}
+}
+
+// setupStream creates the stream and registers its deletion, so a failing
+// assert can never leave it behind.
+//
+// The stream owns `<name>.>` rather than a global slice. Rust can afford
+// `*.>` because every test there spawns its own broker; these share one, and
+// two streams may not claim overlapping subjects — a second `*.>` comes back
+// as `StreamAlreadyExists` even under a fresh name. Scoping by name is also
+// what the project requires of any stream.
+func setupStream(t *testing.T, c *Client, ctx context.Context, name string) {
+	t.Helper()
+	if _, err := c.CreateStream(ctx, name, StreamConfig{SubjectFilter: name + ".>"}); err != nil {
+		t.Fatalf("create stream %s: %v", name, err)
+	}
+	// Cleanup dials its own connection: `t.Cleanup` runs after the test's
+	// defers, so every client the test held is already closed by then and a
+	// delete on `c` would fail silently, leaving the stream behind.
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		admin, err := Connect(cctx, replayAddr())
+		if err != nil {
+			t.Errorf("cleanup could not dial to delete %s: %v", name, err)
+			return
+		}
+		defer admin.Close()
+		if err := admin.DeleteStream(cctx, name); err != nil {
+			t.Errorf("cleanup failed to delete %s: %v", name, err)
+		}
+	})
+}
+
+// publishFixture writes the six messages every case reads back.
+func publishFixture(t *testing.T, c *Client, ctx context.Context, stream string) {
+	t.Helper()
+	for i := 0; i < fanOrders; i++ {
+		if err := c.PublishWait(ctx, stream, fmt.Sprintf("%s.orders.%d", stream, i), []byte("o")); err != nil {
+			t.Fatalf("publish order: %v", err)
+		}
+	}
+	for i := 0; i < fanPayments; i++ {
+		if err := c.PublishWait(ctx, stream, fmt.Sprintf("%s.payments.%d", stream, i), []byte("p")); err != nil {
+			t.Fatalf("publish payment: %v", err)
+		}
+	}
+	// Matches the consumer's wide filter and only the widest subscription.
+	// Handed to a narrow one, it would be stranded.
+	if err := c.PublishWait(ctx, stream, stream+".audit.trail", []byte("x")); err != nil {
+		t.Fatalf("publish audit: %v", err)
+	}
+}
+
+// drain reads until the subscription goes quiet, acking as it goes.
+func drain(sub *Subscription) []string {
+	var out []string
+	for {
 		select {
 		case m, ok := <-sub.Messages():
 			if !ok {
-				return got
+				return out
 			}
-			got = append(got, m)
-		case <-deadline:
-			return got
+			out = append(out, m.Subject())
+			m.Ack()
+		case <-time.After(400 * time.Millisecond):
+			return out
 		}
 	}
-	return got
 }
 
-// subjectsOf is a readable failure message rather than a pile of pointers.
-func subjectsOf(msgs []*Msg) []string {
-	out := make([]string, len(msgs))
-	for i, m := range msgs {
-		out[i] = m.Subject()
+// subscribeTrio opens the three filtered subscriptions every case uses.
+func subscribeTrio(t *testing.T, c *Client, ctx context.Context, stream string, cfg ConsumerConfig) (*Subscription, *Subscription, *Subscription) {
+	t.Helper()
+	orders, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".orders.*"))
+	if err != nil {
+		t.Fatalf("subscribe orders: %v", err)
 	}
-	return out
+	pay, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".payments.*"))
+	if err != nil {
+		t.Fatalf("subscribe payments: %v", err)
+	}
+	all, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".>"))
+	if err != nil {
+		t.Fatalf("subscribe catch-all: %v", err)
+	}
+	return orders, pay, all
 }
 
-// TestFanoutSiblingSubscriptionsEachGetTheirFilter proves the local fan-out:
-// one consumer, three subscriptions, three different filters, and every
-// message reaches exactly the subscriptions whose filter accepts it.
-func TestFanoutSiblingSubscriptionsEachGetTheirFilter(t *testing.T) {
+// assertOutcome is the Rust `assert_outcome`, verbatim in intent.
+func assertOutcome(t *testing.T, label string, orders, pay, all []string) {
+	t.Helper()
+
+	// 1. Nobody may receive what its own filter excludes. Subjects are scoped
+	//    under the stream name, so the discriminating token sits in the middle.
+	for _, s := range orders {
+		if !strings.Contains(s, ".orders.") {
+			t.Errorf("[%s] orders subscription got a foreign subject: %v", label, orders)
+			break
+		}
+	}
+	for _, s := range pay {
+		if !strings.Contains(s, ".payments.") {
+			t.Errorf("[%s] payments subscription got a foreign subject: %v", label, pay)
+			break
+		}
+	}
+
+	// 2. Fanout: each subscription sees every message its filter accepts, so
+	//    the counts are exact and independent — a short count is a lost
+	//    message, not a split.
+	if len(orders) != fanOrders {
+		t.Errorf("[%s] orders.* saw %d of %d: %v", label, len(orders), fanOrders, orders)
+	}
+	if len(pay) != fanPayments {
+		t.Errorf("[%s] payments.* saw %d of %d: %v", label, len(pay), fanPayments, pay)
+	}
+	if len(all) != fanTotal {
+		t.Errorf("[%s] the catch-all saw %d of %d: %v", label, len(all), fanTotal, all)
+	}
+}
+
+// TestFilteredSubsOnOneConsumerSameConnection — one connection, one consumer,
+// three filters. Before routing was keyed by subscription this was
+// unreachable from Go: the dispatch table was keyed by consumer, so the
+// second subscribe overwrote the first.
+func TestFilteredSubsOnOneConsumerSameConnection(t *testing.T) {
 	c := dialOrSkip(t)
 	defer c.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	stream := unique("gofan")
-	if _, err := c.CreateStream(ctx, stream, StreamConfig{
-		SubjectFilter: stream + ".>",
-	}); err != nil {
-		t.Fatalf("create stream: %v", err)
-	}
-
-	// One consumer — the same Name for all three subscribes resolves to it.
-	cfg := ConsumerConfig{
-		Name:      unique("fanconsumer"),
-		Fanout:    true,
-		AckPolicy: 0, // None: this test measures routing, not ack accounting
-	}
-
-	subA, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".a"))
-	if err != nil {
-		t.Fatalf("subscribe a: %v", err)
-	}
-	defer subA.Close()
-
-	subB, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".b"))
-	if err != nil {
-		t.Fatalf("subscribe b: %v", err)
-	}
-	defer subB.Close()
-
-	subAll, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".>"))
-	if err != nil {
-		t.Fatalf("subscribe all: %v", err)
-	}
-	defer subAll.Close()
-
-	// Distinct ids are the whole premise: same id would mean the broker
-	// cannot tell the siblings apart on ack.
-	if subA.ID() == subB.ID() || subB.ID() == subAll.ID() || subA.ID() == subAll.ID() {
-		t.Fatalf("sibling subscriptions share an id: %d %d %d",
-			subA.ID(), subB.ID(), subAll.ID())
-	}
-
-	if err := c.Publish(ctx, stream, stream+".a", []byte("A")); err != nil {
-		t.Fatalf("publish a: %v", err)
-	}
-	if err := c.Publish(ctx, stream, stream+".b", []byte("B")); err != nil {
-		t.Fatalf("publish b: %v", err)
-	}
-
-	gotA := collect(subA, 1, 5*time.Second)
-	gotB := collect(subB, 1, 5*time.Second)
-	gotAll := collect(subAll, 2, 5*time.Second)
-
-	if len(gotA) != 1 || gotA[0].Subject() != stream+".a" {
-		t.Errorf("filtered sub a: got %v, want [%s.a]", subjectsOf(gotA), stream)
-	}
-	if len(gotB) != 1 || gotB[0].Subject() != stream+".b" {
-		t.Errorf("filtered sub b: got %v, want [%s.b]", subjectsOf(gotB), stream)
-	}
-	if len(gotAll) != 2 {
-		t.Errorf("wildcard sub: got %v, want both subjects", subjectsOf(gotAll))
-	}
-
-	// Every copy must name its OWN subscription, not the one the broker
-	// happened to stamp on the wire.
-	for _, m := range gotA {
-		if m.subID != subA.ID() {
-			t.Errorf("copy delivered to sub a carries sub_id %d, want %d", m.subID, subA.ID())
-		}
-	}
-	for _, m := range gotAll {
-		if m.subID != subAll.ID() {
-			t.Errorf("copy delivered to wildcard sub carries sub_id %d, want %d", m.subID, subAll.ID())
-		}
-	}
-}
-
-// TestFanoutSiblingsAckTheirOwnPending is the same topology under explicit
-// acks. The broker opens ONE pending per subscription, so every sibling owes
-// an ack under its own id; a client that acked once per wire copy would leave
-// the others open and see them redelivered once ack_wait expires.
-func TestFanoutSiblingsAckTheirOwnPending(t *testing.T) {
-	c := dialOrSkip(t)
-	defer c.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	stream := unique("gofanack")
-	if _, err := c.CreateStream(ctx, stream, StreamConfig{
-		SubjectFilter: stream + ".>",
-	}); err != nil {
-		t.Fatalf("create stream: %v", err)
+	stream := unique("triage_same")
+	setupStream(t, c, ctx, stream)
+	cfg := wideConsumer(unique("worker_same"))
+
+	orders, pay, all := subscribeTrio(t, c, ctx, stream, cfg)
+	defer orders.Close()
+	defer pay.Close()
+	defer all.Close()
+
+	// Distinct, non-zero ids are the premise: zero is the broker's "unnamed"
+	// sentinel and identical ids would leave the siblings indistinguishable.
+	if orders.ID() == pay.ID() || pay.ID() == all.ID() || orders.ID() == all.ID() {
+		t.Fatalf("sibling subscriptions share an id: %d %d %d", orders.ID(), pay.ID(), all.ID())
+	}
+	if orders.ID() == 0 {
+		t.Fatalf("the allocator handed out the unnamed sentinel")
 	}
 
-	// A short ack deadline so an unreleased pending shows up as a
-	// redelivery inside the test's lifetime instead of after it.
-	cfg := ConsumerConfig{
-		Name:        unique("fanackconsumer"),
-		Fanout:      true,
-		AckPolicy:   1, // Explicit
-		AckWait:     2 * time.Second,
-		MaxInflight: 1024,
-	}
+	publishFixture(t, c, ctx, stream)
+	assertOutcome(t, "same connection", drain(orders), drain(pay), drain(all))
+}
 
-	subA, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".a"))
+// TestFilteredSubsOnOneConsumerAcrossConnections — three CONNECTIONS, one
+// consumer, one filter each. The collapse is keyed by (connection, consumer),
+// so each connection is owed its own copy.
+func TestFilteredSubsOnOneConsumerAcrossConnections(t *testing.T) {
+	admin := dialOrSkip(t)
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	stream := unique("triage_across")
+	setupStream(t, admin, ctx, stream)
+	cfg := wideConsumer(unique("worker_across"))
+
+	c1, c2, c3 := dialOrSkip(t), dialOrSkip(t), dialOrSkip(t)
+	defer c1.Close()
+	defer c2.Close()
+	defer c3.Close()
+
+	orders, err := c1.Subscribe(ctx, stream, cfg, withSubFilter(stream+".orders.*"))
 	if err != nil {
-		t.Fatalf("subscribe a: %v", err)
+		t.Fatalf("subscribe orders: %v", err)
 	}
-	defer subA.Close()
-
-	subAll, err := c.Subscribe(ctx, stream, cfg, withSubFilter(stream+".>"))
+	defer orders.Close()
+	pay, err := c2.Subscribe(ctx, stream, cfg, withSubFilter(stream+".payments.*"))
 	if err != nil {
-		t.Fatalf("subscribe all: %v", err)
+		t.Fatalf("subscribe payments: %v", err)
 	}
-	defer subAll.Close()
+	defer pay.Close()
+	all, err := c3.Subscribe(ctx, stream, cfg, withSubFilter(stream+".>"))
+	if err != nil {
+		t.Fatalf("subscribe catch-all: %v", err)
+	}
+	defer all.Close()
 
-	if err := c.Publish(ctx, stream, stream+".a", []byte("A")); err != nil {
-		t.Fatalf("publish: %v", err)
+	publishFixture(t, admin, ctx, stream)
+	assertOutcome(t, "across connections", drain(orders), drain(pay), drain(all))
+}
+
+// TestFilteredSubsOnFourConnections — the same arrangement four times over.
+// Proves the two halves compose: collapsing per (connection, consumer) really
+// is per connection, and four clients reading one consumer neither steal from
+// nor duplicate each other.
+//
+// Two ways this fails, meaning opposite things: a row of [0 0 6] is that
+// connection's client merging its three handles into one; rows that disagree
+// with each other would be the broker singling out a connection.
+func TestFilteredSubsOnFourConnections(t *testing.T) {
+	admin := dialOrSkip(t)
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stream := unique("triage_quad")
+	setupStream(t, admin, ctx, stream)
+	cfg := wideConsumer(unique("worker_quad"))
+
+	const conns = 4
+	type row struct{ orders, pay, all *Subscription }
+	rows := make([]row, 0, conns)
+	for i := 0; i < conns; i++ {
+		c := dialOrSkip(t)
+		defer c.Close()
+		// Same three filters on every connection — nothing distinguishes
+		// them but the socket, which is the variable under test.
+		o, p, a := subscribeTrio(t, c, ctx, stream, cfg)
+		defer o.Close()
+		defer p.Close()
+		defer a.Close()
+		rows = append(rows, row{o, p, a})
 	}
 
-	// Both siblings match `<stream>.a`, so both must see it.
-	gotA := collect(subA, 1, 5*time.Second)
-	gotAll := collect(subAll, 1, 5*time.Second)
-	if len(gotA) != 1 {
-		t.Fatalf("filtered sub never received its copy")
-	}
-	if len(gotAll) != 1 {
-		t.Fatalf("wildcard sub never received its copy")
+	publishFixture(t, admin, ctx, stream)
+
+	shape := make([][3]int, 0, conns)
+	for i, r := range rows {
+		gotO, gotP, gotA := drain(r.orders), drain(r.pay), drain(r.all)
+		label := fmt.Sprintf("four conns/%d", i)
+		assertOutcome(t, label, gotO, gotP, gotA)
+		if total := len(gotO) + len(gotP) + len(gotA); total != fanPerConsumer {
+			t.Errorf("[%s] made %d deliveries, expected %d", label, total, fanPerConsumer)
+		}
+		// A connection that funnelled its three subscriptions into one handle.
+		if len(gotO) == 0 || len(gotP) == 0 {
+			t.Errorf("[%s] funnelled its subscriptions into one handle: %d/%d/%d",
+				label, len(gotO), len(gotP), len(gotA))
+		}
+		shape = append(shape, [3]int{len(gotO), len(gotP), len(gotA)})
 	}
 
-	// Each releases its own pending.
-	gotA[0].Ack()
-	gotAll[0].Ack()
-
-	// Past the ack deadline, an unreleased pending would come back.
-	if extra := collect(subA, 1, 4*time.Second); len(extra) != 0 {
-		t.Errorf("filtered sub saw a redelivery after acking: %v", subjectsOf(extra))
-	}
-	if extra := collect(subAll, 1, 1*time.Second); len(extra) != 0 {
-		t.Errorf("wildcard sub saw a redelivery after acking: %v", subjectsOf(extra))
+	// The rows must be identical. One that differs means the broker treated a
+	// connection differently — a distribution bug, not a client one.
+	for i := 1; i < len(shape); i++ {
+		if shape[i] != shape[0] {
+			t.Errorf("connections disagree: %v — under fanout every connection is owed the same fixture", shape)
+			break
+		}
 	}
 }
 
-// TestSubscriptionIDsAreNonZeroAndUnique pins the wire contract itself: a
-// zero id is the broker's "unnamed" sentinel and sends every ack down the
-// binding-scan path, so the allocator must never hand one out.
-func TestSubscriptionIDsAreNonZeroAndUnique(t *testing.T) {
-	c := &Client{}
-	seen := make(map[uint32]struct{}, 64)
-	for i := 0; i < 64; i++ {
-		id := c.allocSubID()
-		if id == 0 {
-			t.Fatalf("allocator handed out the unnamed sentinel at iteration %d", i)
+// TestNineConsumersEachWithThreeFilteredSubscriptions — both shapes at once:
+// three connections × three CONSUMERS × three filtered SUBSCRIPTIONS.
+//
+// Consumers are independent (separate cursors, no collapse between them);
+// subscriptions of one consumer are not. So per connection the wire carries
+// 3 × 6 = 18 copies and the handles see 3 × 11 = 33 deliveries.
+func TestNineConsumersEachWithThreeFilteredSubscriptions(t *testing.T) {
+	admin := dialOrSkip(t)
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	stream := unique("triage_nine")
+	setupStream(t, admin, ctx, stream)
+
+	const conns, perConn = 3, 3
+	type row struct{ orders, pay, all *Subscription }
+	rows := make([]row, 0, conns*perConn)
+	for ci := 0; ci < conns; ci++ {
+		c := dialOrSkip(t)
+		defer c.Close()
+		for si := 0; si < perConn; si++ {
+			cfg := wideConsumer(unique(fmt.Sprintf("w_%d_%d", ci, si)))
+			o, p, a := subscribeTrio(t, c, ctx, stream, cfg)
+			defer o.Close()
+			defer p.Close()
+			defer a.Close()
+			rows = append(rows, row{o, p, a})
 		}
-		if _, dup := seen[id]; dup {
-			t.Fatalf("allocator repeated id %d", id)
+	}
+
+	publishFixture(t, admin, ctx, stream)
+
+	total := 0
+	for i, r := range rows {
+		gotO, gotP, gotA := drain(r.orders), drain(r.pay), drain(r.all)
+		label := fmt.Sprintf("nine/%d", i)
+		assertOutcome(t, label, gotO, gotP, gotA)
+		n := len(gotO) + len(gotP) + len(gotA)
+		if n != fanPerConsumer {
+			t.Errorf("[%s] %d deliveries, expected %d", label, n, fanPerConsumer)
 		}
-		seen[id] = struct{}{}
+		total += n
+	}
+
+	// Nine independent consumers: nothing shared, nobody short of a full copy.
+	if want := conns * perConn * fanPerConsumer; total != want {
+		t.Errorf("%d deliveries across the nine consumers, expected %d", total, want)
+	}
+}
+
+// TestTwoConsumersMaySharedOneFilter — two consumers, same stream, SAME
+// filter, different names.
+//
+// Streams may not have overlapping filters. Nothing says the same about
+// consumers, and the natural reading is that they are independent readers of
+// one log. This pins whether the broker agrees.
+func TestTwoConsumersMaySharedOneFilter(t *testing.T) {
+	admin := dialOrSkip(t)
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	stream := unique("shared_filter")
+	setupStream(t, admin, ctx, stream)
+
+	mk := func(name string) ConsumerConfig {
+		return ConsumerConfig{
+			Name: name, Filter: stream + ".orders.>", AckPolicy: 1,
+			MaxInflight: 100, AckWait: 30 * time.Second,
+		}
+	}
+
+	firstCfg := mk(unique("reader_one"))
+	firstID, err := admin.CreateConsumer(ctx, stream, firstCfg)
+	if err != nil {
+		t.Fatalf("first consumer with orders.> filter: %v", err)
+	}
+	secondCfg := mk(unique("reader_two"))
+	secondID, err := admin.CreateConsumer(ctx, stream, secondCfg)
+	if err != nil {
+		t.Fatalf("the broker refused a second consumer with filter orders.>: %v — "+
+			"if that is intentional it belongs in the docs; today only STREAM "+
+			"filters are documented as non-overlapping", err)
+	}
+	if firstID == secondID {
+		t.Fatalf("two consumers sharing a filter collapsed onto one id: %d", firstID)
+	}
+
+	// Independent readers: each should see every matching message.
+	c1, c2 := dialOrSkip(t), dialOrSkip(t)
+	defer c1.Close()
+	defer c2.Close()
+	// One subscription per CONSUMER. Both on the same consumer would be a work
+	// queue splitting the three messages, which is not what this pins.
+	s1, err := c1.Subscribe(ctx, stream, firstCfg)
+	if err != nil {
+		t.Fatalf("subscribe reader_one: %v", err)
+	}
+	defer s1.Close()
+	s2, err := c2.Subscribe(ctx, stream, secondCfg)
+	if err != nil {
+		t.Fatalf("subscribe reader_two: %v", err)
+	}
+	defer s2.Close()
+
+	for i := 0; i < 3; i++ {
+		if err := admin.PublishWait(ctx, stream, fmt.Sprintf("%s.orders.%d", stream, i), []byte("o")); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	got1, got2 := drain(s1), drain(s2)
+	if len(got1) != 3 {
+		t.Errorf("reader_one missed messages: %v — two consumers on one filter are not independent", got1)
+	}
+	if len(got2) != 3 {
+		t.Errorf("reader_two missed messages: %v — the second consumer is starved by the first", got2)
+	}
+}
+
+// TestTwoConsumersWithTheSameName — the same NAME, twice, on one stream.
+//
+// Consumer ids are namespaced by (stream, name), so a repeat of the same name
+// must resolve to the SAME consumer. And a conflicting config must be
+// refused, not silently ignored: a no-op is worse than an error, because the
+// config the caller believes in never took effect.
+func TestTwoConsumersWithTheSameName(t *testing.T) {
+	admin := dialOrSkip(t)
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	stream := unique("same_name")
+	setupStream(t, admin, ctx, stream)
+	name := unique("duplicate")
+
+	base := ConsumerConfig{
+		Name: name, Filter: stream + ".orders.>", AckPolicy: 1,
+		MaxInflight: 100, AckWait: 30 * time.Second,
+	}
+
+	first, err := admin.CreateConsumer(ctx, stream, base)
+	if err != nil {
+		t.Fatalf("first consumer: %v", err)
+	}
+
+	// Identical config. If names are keys, this is an idempotent re-create.
+	same, err := admin.CreateConsumer(ctx, stream, base)
+	if err == nil && same != first {
+		t.Errorf("the same name with the same config produced a SECOND consumer (%d != %d) — "+
+			"ids are supposed to be namespaced by (stream, name)", same, first)
+	}
+
+	// A different filter under the same name. If this is accepted AND returns
+	// the first id, the second call's config is silently discarded.
+	other := base
+	other.Filter = stream + ".telemetry.>"
+	other.MaxInflight = 999
+	if id, err := admin.CreateConsumer(ctx, stream, other); err == nil {
+		t.Errorf("the same name with a DIFFERENT filter was accepted and returned id=%d (first=%d) — "+
+			"the caller asked for telemetry.> and max_inflight=999 and got neither", id, first)
 	}
 }
