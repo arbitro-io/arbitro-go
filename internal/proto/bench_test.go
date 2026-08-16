@@ -52,7 +52,7 @@ func BenchmarkEncodeAck(b *testing.B) {
 func BenchmarkEncodeBatchAck64(b *testing.B) {
 	entries := make([]AckEntry, 64)
 	for i := range entries {
-		entries[i] = AckEntry{Seq: uint64(i), SubjectHash: uint32(i * 37)}
+		entries[i] = AckEntry{Seq: uint64(i), SubID: uint32(i * 37)}
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

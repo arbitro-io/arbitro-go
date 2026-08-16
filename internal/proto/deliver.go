@@ -3,10 +3,16 @@ package proto
 import "encoding/binary"
 
 // DeliverHeader contains the parsed fields from a Deliver frame body.
+//
+// `SubID` is the subscription id the CLIENT chose and sent on Subscribe.
+// The broker stamps it on every delivery and expects it back on the ack,
+// which is how the ack reaches its pending in one hash instead of a scan
+// over the consumer's bindings. The field used to carry a subject hash;
+// only the name lagged behind.
 type DeliverHeader struct {
-	ConsumerID  uint32
-	SubjectHash uint32
-	SubjectLen  uint16
+	ConsumerID uint32
+	SubID      uint32
+	SubjectLen uint16
 }
 
 // DeliverBodyOffset is the fixed prefix of a Deliver body before the subject.
@@ -15,9 +21,9 @@ const DeliverBodyOffset = 12
 // DecodeDeliverHeader parses the first 12 bytes of a Deliver body.
 func DecodeDeliverHeader(body []byte) DeliverHeader {
 	return DeliverHeader{
-		ConsumerID:  binary.LittleEndian.Uint32(body[0:4]),
-		SubjectHash: binary.LittleEndian.Uint32(body[4:8]),
-		SubjectLen:  binary.LittleEndian.Uint16(body[8:10]),
+		ConsumerID: binary.LittleEndian.Uint32(body[0:4]),
+		SubID:      binary.LittleEndian.Uint32(body[4:8]),
+		SubjectLen: binary.LittleEndian.Uint16(body[8:10]),
 		// body[10:12] is reserved padding
 	}
 }

@@ -18,15 +18,26 @@ import (
 const subChanCap = 4096
 
 // Subscription represents an active message subscription.
+//
+// `id` is chosen by this client, unique per connection, and is what the
+// broker stamps on deliveries and expects back on acks. Several
+// subscriptions may share one consumer, each with its own filter; the
+// broker sends a single wire copy and this client fans it out to the
+// siblings whose filter matches.
 type Subscription struct {
 	client     *Client
+	id         uint32
 	consumerID uint32
+	match      matcher
 	ch         chan *Msg
 	handler    func(*Msg)
 	closed     chan struct{}
 	closeOnce  sync.Once
 	slot       ackstore.SlotRef // redelivery-dedup handle (nil if dedup disabled)
 }
+
+// ID returns the subscription id this client assigned.
+func (s *Subscription) ID() uint32 { return s.id }
 
 // Messages returns the delivery channel. Range over it for push-mode consumption.
 // The channel is closed when the subscription is closed or the connection drops.
@@ -55,7 +66,7 @@ func (s *Subscription) Fetch(ctx context.Context, count int) ([]*Msg, error) {
 func (s *Subscription) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.client.unregisterSubscription(s.consumerID)
+		s.client.unregisterSubscription(s.id)
 		// Send Unsubscribe frame
 		seq := s.client.getConn().NextSeq()
 		frame, _ := proto.EncodeUnsubscribe(seq, s.consumerID)
@@ -72,7 +83,7 @@ func (s *Subscription) Close() {
 func (s *Subscription) closeLocal() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.client.unregisterSubscription(s.consumerID)
+		s.client.unregisterSubscription(s.id)
 		s.client.activeSubs.Add(^uint64(0)) // decrement
 		close(s.ch)
 	})
@@ -83,19 +94,22 @@ const ReplyToMagic = 0xFF
 
 // Msg represents a delivered message. Zero-copy: Subject/Data are slices into the frame buffer.
 type Msg struct {
-	frame       []byte
-	consumerID  uint32
-	subjectHash uint32
-	seq         uint64
-	subjectOff  int
-	subjectLen  int
-	replyToOff  int
-	replyToLen  int
-	payloadOff  int
-	payloadLen  int
-	client      *Client
-	slot        ackstore.SlotRef // dedup handle for this message's consumer (may be nil)
-	acked       bool
+	frame      []byte
+	consumerID uint32
+	// subID is the subscription this copy belongs to — not necessarily the
+	// one the broker stamped on the wire, since a fanned-out sibling carries
+	// its own id. It is what the ack echoes back.
+	subID      uint32
+	seq        uint64
+	subjectOff int
+	subjectLen int
+	replyToOff int
+	replyToLen int
+	payloadOff int
+	payloadLen int
+	client     *Client
+	slot       ackstore.SlotRef // dedup handle for this message's consumer (may be nil)
+	acked      bool
 }
 
 // Subject returns the message subject as a string.
@@ -169,7 +183,7 @@ func (m *Msg) Ack() {
 		return
 	}
 	m.acked = true
-	m.client.getConn().AckBatch.Ack(m.consumerID, m.subjectHash, m.seq)
+	m.client.getConn().AckBatch.Ack(m.consumerID, m.subID, m.seq)
 	m.client.acksSent.Add(1)
 	if m.slot != nil {
 		_ = m.slot.Record(m.seq)
@@ -183,7 +197,7 @@ func (m *Msg) Nack() {
 	}
 	m.acked = true
 	seq := m.client.getConn().NextSeq()
-	frame := proto.EncodeNack(seq, m.consumerID, m.subjectHash, m.seq)
+	frame := proto.EncodeNack(seq, m.consumerID, m.subID, m.seq)
 	_ = m.client.getConn().TrySend(frame)
 	m.client.nacksSent.Add(1)
 }
@@ -196,9 +210,9 @@ func (m *Msg) NackDelay(d time.Duration) {
 	m.acked = true
 	seq := m.client.getConn().NextSeq()
 	entry := proto.NackEntry{
-		Seq:         m.seq,
-		SubjectHash: m.subjectHash,
-		DelayMs:     uint32(d.Milliseconds()),
+		Seq:     m.seq,
+		SubID:   m.subID,
+		DelayMs: uint32(d.Milliseconds()),
 	}
 	frame := proto.EncodeBatchNack(seq, m.consumerID, []proto.NackEntry{entry})
 	_ = m.client.getConn().TrySend(frame)
@@ -329,6 +343,7 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 
 	sub := &Subscription{
 		client:     c,
+		id:         c.allocSubID(),
 		consumerID: consumerID,
 		ch:         make(chan *Msg, subChanCap),
 		handler:    so.handler,
@@ -360,20 +375,35 @@ func (c *Client) Subscribe(ctx context.Context, stream string, cfg ConsumerConfi
 		filters = [][]byte{[]byte(c.prefixed(subFilter))}
 	}
 
+	// The matcher decides, on the delivery path, whether a fanned-out copy
+	// belongs to this subscription. Classified once, here, so the hot path
+	// never re-scans the filter for wildcards.
+	if len(filters) > 0 {
+		sub.match = newMatcher(filters[0])
+	}
+
 	// Register subscription in dispatch table, and stash the filters so the
 	// reconnect supervisor (G02) can replay this Subscribe against a freshly
 	// redialed connection.
-	c.registerSubscription(consumerID, sub, filters)
+	c.registerSubscription(sub, filters)
 	c.activeSubs.Add(1)
 
 	seq := c.getConn().NextSeq()
-	frame, err := proto.EncodeSubscribe(seq, consumerID, filters)
+	frame, err := proto.EncodeSubscribe(seq, consumerID, sub.id, filters)
 	if err != nil {
 		return nil, err
 	}
-	_, err = c.getConn().SendExpectReply(ctx, frame, seq)
+	reply, err := c.getConn().SendExpectReply(ctx, frame, seq)
 	if err != nil {
 		return nil, err
+	}
+
+	// The broker reports the delivery mode in the RepOk ref_seq: bit 63 set
+	// means fanout. Queue mode has exactly one target per copy; fanout means
+	// this client must hand each copy to every sibling whose filter matches.
+	if len(reply) >= proto.HeaderSize+8 {
+		refSeq := proto.RepOkRefSeq(reply[proto.HeaderSize:])
+		c.subs.setFanout(consumerID, refSeq>>63 == 1)
 	}
 
 	// On-connect ackstore purge: the store may hold entries recorded by a
@@ -489,25 +519,40 @@ func (c *Client) ensureConsumer(ctx context.Context, stream string, cfg Consumer
 	return consumerID, nil
 }
 
+// subReplay is what the reconnect supervisor needs to re-issue one
+// Subscribe frame: the consumer it binds to and the filters it asked for.
+// Keyed by sub_id, because that id must survive the redial — the broker
+// stamps it on deliveries and the client's routes are keyed by it.
+type subReplay struct {
+	consumerID uint32
+	filters    [][]byte
+}
+
+// allocSubID hands out the next subscription id for this connection.
+// Starts at 1 — zero is the wire's "unnamed" sentinel.
+func (c *Client) allocSubID() uint32 {
+	return c.nextSubID.Add(1)
+}
+
 // registerSubscription stores the subscription for delivery dispatch and
 // remembers its filters (guarded by subFilterMu) so the reconnect supervisor
 // can replay the Subscribe frame after a redial. filters may be nil for
 // subscriptions (e.g. service consumers) that pass their own filter list
 // directly at the call site.
-func (c *Client) registerSubscription(consumerID uint32, sub *Subscription, filters [][]byte) {
-	c.subs.Store(consumerID, sub)
+func (c *Client) registerSubscription(sub *Subscription, filters [][]byte) {
+	c.subs.register(sub)
 	c.subFilterMu.Lock()
 	if c.subFilters == nil {
-		c.subFilters = make(map[uint32][][]byte)
+		c.subFilters = make(map[uint32]subReplay)
 	}
-	c.subFilters[consumerID] = filters
+	c.subFilters[sub.id] = subReplay{consumerID: sub.consumerID, filters: filters}
 	c.subFilterMu.Unlock()
 }
 
-func (c *Client) unregisterSubscription(consumerID uint32) {
-	c.subs.Delete(consumerID)
+func (c *Client) unregisterSubscription(subID uint32) {
+	c.subs.remove(subID)
 	c.subFilterMu.Lock()
-	delete(c.subFilters, consumerID)
+	delete(c.subFilters, subID)
 	c.subFilterMu.Unlock()
 }
 

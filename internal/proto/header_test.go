@@ -141,8 +141,8 @@ func TestDeliverDecoding(t *testing.T) {
 	if dh.ConsumerID != 3 {
 		t.Errorf("consumer_id: got %d, want 3", dh.ConsumerID)
 	}
-	if dh.SubjectHash != 42 {
-		t.Errorf("subject_hash: got %d, want 42", dh.SubjectHash)
+	if dh.SubID != 42 {
+		t.Errorf("sub_id: got %d, want 42", dh.SubID)
 	}
 	if dh.SubjectLen != 5 {
 		t.Errorf("subject_len: got %d, want 5", dh.SubjectLen)

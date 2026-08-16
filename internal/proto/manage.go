@@ -44,14 +44,21 @@ type subscribePayload struct {
 	Filters        [][]int `json:"filters"`
 }
 
-func EncodeSubscribe(seq uint64, consumerID uint32, filters [][]byte) ([]byte, error) {
+// EncodeSubscribe builds a Subscribe frame.
+//
+// The CLIENT owns `subID`: it is unique per connection, the broker stores it
+// and stamps it on every delivery, and the client echoes it back on ack. A
+// zero id still works — the broker falls back to scanning the consumer's
+// bindings — but it collides across sibling subscriptions and cannot address
+// one of several subscriptions sharing a consumer.
+func EncodeSubscribe(seq uint64, consumerID, subID uint32, filters [][]byte) ([]byte, error) {
 	f := make([][]int, len(filters))
 	for i, flt := range filters {
 		f[i] = bytesArr(flt)
 	}
 	return packCold(ActionSubscribe, seq, subscribePayload{
 		ConsumerID:     consumerID,
-		SubscriptionID: 0,
+		SubscriptionID: subID,
 		Filters:        f,
 	})
 }

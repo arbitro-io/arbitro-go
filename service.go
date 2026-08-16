@@ -398,18 +398,21 @@ func (b *ServiceBuilder) Build(ctx context.Context) (*Service, error) {
 		{workerConsumerID, workerFilter},
 		{replyConsumerID, replyFilter},
 	} {
+		filters := [][]byte{[]byte(entry.filter)}
 		sub := &Subscription{
 			client:     b.client,
+			id:         b.client.allocSubID(),
 			consumerID: entry.cid,
+			match:      newMatcher(filters[0]),
 			ch:         make(chan *Msg, subChanCap),
 			handler:    svc.dispatch,
 			closed:     make(chan struct{}),
 		}
-		b.client.registerSubscription(entry.cid, sub, [][]byte{[]byte(entry.filter)})
+		b.client.registerSubscription(sub, filters)
 		b.client.activeSubs.Add(1)
 
 		seq = b.client.getConn().NextSeq()
-		subFrame, err := proto.EncodeSubscribe(seq, entry.cid, [][]byte{[]byte(entry.filter)})
+		subFrame, err := proto.EncodeSubscribe(seq, entry.cid, sub.id, filters)
 		if err != nil {
 			return nil, err
 		}

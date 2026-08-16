@@ -10,10 +10,14 @@ import (
 const ackBatchMax = 64
 
 // AckItem represents a single ack to be batched.
+//
+// SubID names the subscription that received the copy. Batching groups by
+// consumer, but the id stays per entry: sibling subscriptions of one
+// consumer each own a pending, and each must be released by its own id.
 type AckItem struct {
-	ConsumerID  uint32
-	SubjectHash uint32
-	Seq         uint64
+	ConsumerID uint32
+	SubID      uint32
+	Seq        uint64
 }
 
 // AckBatcher accumulates individual acks and flushes them as BatchAck frames.
@@ -39,9 +43,9 @@ func NewAckBatcher(c *Connection) *AckBatcher {
 }
 
 // Ack enqueues an ack for batching. Non-blocking.
-func (ab *AckBatcher) Ack(consumerID, subjectHash uint32, seq uint64) {
+func (ab *AckBatcher) Ack(consumerID, subID uint32, seq uint64) {
 	select {
-	case ab.ch <- AckItem{ConsumerID: consumerID, SubjectHash: subjectHash, Seq: seq}:
+	case ab.ch <- AckItem{ConsumerID: consumerID, SubID: subID, Seq: seq}:
 	case <-ab.done:
 	}
 }
@@ -57,8 +61,8 @@ func (ab *AckBatcher) run() {
 				return
 			}
 			pending[item.ConsumerID] = append(pending[item.ConsumerID], proto.AckEntry{
-				Seq:         item.Seq,
-				SubjectHash: item.SubjectHash,
+				Seq:   item.Seq,
+				SubID: item.SubID,
 			})
 
 		drain:
@@ -70,8 +74,8 @@ func (ab *AckBatcher) run() {
 						return
 					}
 					pending[it.ConsumerID] = append(pending[it.ConsumerID], proto.AckEntry{
-						Seq:         it.Seq,
-						SubjectHash: it.SubjectHash,
+						Seq:   it.Seq,
+						SubID: it.SubID,
 					})
 					if len(pending[it.ConsumerID]) >= ackBatchMax {
 						ab.flushConsumer(pending, it.ConsumerID)
@@ -153,7 +157,7 @@ func encodeSingleAckInline(seq uint64, consumerID uint32, entry proto.AckEntry) 
 	})
 	body := frame[proto.HeaderSize:]
 	binary.LittleEndian.PutUint32(body[0:4], consumerID)
-	binary.LittleEndian.PutUint32(body[4:8], entry.SubjectHash)
+	binary.LittleEndian.PutUint32(body[4:8], entry.SubID)
 	binary.LittleEndian.PutUint64(body[8:16], entry.Seq)
 	return frame
 }

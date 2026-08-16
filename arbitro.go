@@ -45,14 +45,20 @@ type Client struct {
 	reconnCfg conn.ReconnectConfig
 	streams   streamCache
 
-	// Subscription dispatch: consumer_id → subscription
-	subs sync.Map // map[uint32]*Subscription
+	// Subscription dispatch: sub_id → route. Keyed by SUBSCRIPTION, not by
+	// consumer, so several filtered subscriptions can share one consumer.
+	subs *registry
 
-	// subFilters stores the Subscribe filters per consumer_id so the
-	// reconnect supervisor can replay them against a freshly (re)dialed
-	// connection. Guarded by subFilterMu.
+	// nextSubID hands out subscription ids for this connection. Starts at 1:
+	// zero means "unnamed" on the wire and sends the broker down its
+	// binding-scan path.
+	nextSubID atomic.Uint32
+
+	// subFilters stores the Subscribe filters per sub_id so the reconnect
+	// supervisor can replay them against a freshly (re)dialed connection.
+	// Guarded by subFilterMu.
 	subFilterMu sync.Mutex
-	subFilters  map[uint32][][]byte
+	subFilters  map[uint32]subReplay
 
 	// Cron registry
 	cronMu sync.Mutex
@@ -66,9 +72,9 @@ type Client struct {
 	// Default in-memory; WithAckPersistence swaps in a durable WAL. Nil when
 	// dedup is disabled. Outlives connections. A background goroutine flushes
 	// it (Sync) so recorded acks become durable without blocking the ack path.
-	ackStore     ackstore.Store
-	ackSyncStop  chan struct{}
-	ackSyncOnce  sync.Once
+	ackStore    ackstore.Store
+	ackSyncStop chan struct{}
+	ackSyncOnce sync.Once
 
 	// metrics. AcksDeferred/AcksConfirmed/AcksExpired (G14) are NOT tracked
 	// here as separate atomics — they're sourced live from ackRelay
@@ -147,7 +153,8 @@ func Connect(ctx context.Context, addr string, opts ...Option) (*Client, error) 
 		streams: streamCache{
 			cache: make(map[string]uint32),
 		},
-		subFilters: make(map[uint32][][]byte),
+		subs:       newRegistry(),
+		subFilters: make(map[uint32]subReplay),
 	}
 	// Redelivery dedup (G18) via the ackstore. Default: in-memory store keyed
 	// by (stream, consumer, seq). WithAckPersistence swaps in a durable WAL;
@@ -641,36 +648,78 @@ func (c *Client) dispatchSingleDeliver(hdr proto.Header, frame []byte) {
 	body := frame[proto.HeaderSize:]
 	dh := proto.DecodeDeliverHeader(body)
 
-	sub := c.lookupSub(dh.ConsumerID)
-	if sub == nil {
+	rt := c.subs.lookup(dh.SubID)
+	if rt == nil {
 		return
 	}
 
 	subjOff := proto.HeaderSize + proto.DeliverBodyOffset
 	subjLen := int(dh.SubjectLen)
 	payloadOff := subjOff + subjLen
-	payloadLen := len(frame) - payloadOff
 
-	// Redelivery dedup (G18): if this consumer's ackstore slot has already
-	// recorded this seq, the handler ran before — re-ack without invoking it.
-	if sub.slot != nil && sub.slot.Seen(hdr.Seq) {
-		c.getConn().AckBatch.Ack(dh.ConsumerID, dh.SubjectHash, hdr.Seq)
+	// Redelivery dedup (G18): the slot is keyed (stream, consumer), so the
+	// probe runs ONCE for the whole group — per sibling it would let the
+	// first one mark the seq and the rest discard the message as a dup.
+	if rt.slot != nil && rt.slot.Seen(hdr.Seq) {
+		c.getConn().AckBatch.Ack(dh.ConsumerID, dh.SubID, hdr.Seq)
 		return
 	}
 
-	msg := &Msg{
-		frame:       frame,
-		consumerID:  dh.ConsumerID,
-		subjectHash: dh.SubjectHash,
-		seq:         hdr.Seq,
-		subjectOff:  subjOff,
-		subjectLen:  subjLen,
-		payloadOff:  payloadOff,
-		payloadLen:  payloadLen,
-		client:      c,
-		slot:        sub.slot,
+	c.fanOut(rt, frame, dh.ConsumerID, hdr.Seq, subjOff, subjLen, 0, 0, payloadOff, len(frame)-payloadOff)
+}
+
+// fanOut hands one delivered entry to every subscription that owns it.
+//
+// Queue mode has exactly one target, resolved by index with no search. Fanout
+// walks the consumer's siblings and tests each filter — that walk is the whole
+// point of the broker sending one copy instead of N, and it is bounded by the
+// number of subscriptions the caller created on that consumer, not by
+// anything that grows with traffic.
+//
+// Each copy carries its OWN sub id, because the broker opened one pending per
+// subscription and each must be released by name.
+func (c *Client) fanOut(
+	rt *route, frame []byte, consumerID uint32, seq uint64,
+	subjOff, subjLen, replyOff, replyLen, payloadOff, payloadLen int,
+) {
+	subject := frame[subjOff : subjOff+subjLen]
+
+	if !rt.fanout {
+		if rt.idx >= len(rt.subs) {
+			return
+		}
+		sub := rt.subs[rt.idx]
+		c.deliverOne(sub, rt, frame, consumerID, seq, subjOff, subjLen, replyOff, replyLen, payloadOff, payloadLen)
+		return
 	}
 
+	for _, sub := range rt.subs {
+		if !sub.match.accepts(subject) {
+			continue
+		}
+		c.deliverOne(sub, rt, frame, consumerID, seq, subjOff, subjLen, replyOff, replyLen, payloadOff, payloadLen)
+	}
+}
+
+// deliverOne builds the per-subscription view and hands it over.
+func (c *Client) deliverOne(
+	sub *Subscription, rt *route, frame []byte, consumerID uint32, seq uint64,
+	subjOff, subjLen, replyOff, replyLen, payloadOff, payloadLen int,
+) {
+	msg := &Msg{
+		frame:      frame,
+		consumerID: consumerID,
+		subID:      sub.id,
+		seq:        seq,
+		subjectOff: subjOff,
+		subjectLen: subjLen,
+		replyToOff: replyOff,
+		replyToLen: replyLen,
+		payloadOff: payloadOff,
+		payloadLen: payloadLen,
+		client:     c,
+		slot:       rt.slot,
+	}
 	c.deliverToSub(sub, msg)
 }
 
@@ -685,13 +734,13 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 		if off+24 > len(body) {
 			break
 		}
-		// Entry header: consumer_id(4) + seq(8) + subj_len(2) + reply_len(2) + data_len(4) + subject_hash(4) = 24
+		// Entry header: consumer_id(4) + seq(8) + subj_len(2) + reply_len(2) + data_len(4) + sub_id(4) = 24
 		consumerID := binary.LittleEndian.Uint32(body[off : off+4])
 		seq := binary.LittleEndian.Uint64(body[off+4 : off+12])
 		subjLen := int(binary.LittleEndian.Uint16(body[off+12 : off+14]))
 		replyLen := int(binary.LittleEndian.Uint16(body[off+14 : off+16]))
 		dataLen := int(binary.LittleEndian.Uint32(body[off+16 : off+20]))
-		subjectHash := binary.LittleEndian.Uint32(body[off+20 : off+24])
+		subID := binary.LittleEndian.Uint32(body[off+20 : off+24])
 
 		entryPayloadStart := off + 24
 		// data_len = total variable tail (subject + reply_to + payload)
@@ -702,51 +751,28 @@ func (c *Client) dispatchBatchDeliver(body []byte) {
 
 		c.deliveriesRecv.Add(1)
 
-		sub := c.lookupSub(consumerID)
-		if sub == nil {
+		rt := c.subs.lookup(subID)
+		if rt == nil {
 			off = entryPayloadStart + totalTail
 			continue
 		}
 
-		// Redelivery dedup (G18) — re-ack without re-invoking the handler.
-		if sub.slot != nil && sub.slot.Seen(seq) {
-			c.getConn().AckBatch.Ack(consumerID, subjectHash, seq)
+		// Redelivery dedup (G18) — one probe per group, see dispatchSingleDeliver.
+		if rt.slot != nil && rt.slot.Seen(seq) {
+			c.getConn().AckBatch.Ack(consumerID, subID, seq)
 			off = entryPayloadStart + totalTail
 			continue
 		}
 
-		// Build Msg referencing the batch buffer slice
+		// Offsets into the batch buffer; every sibling shares them.
 		subjOff := entryPayloadStart
 		replyToOff := entryPayloadStart + subjLen
 		payloadOff := entryPayloadStart + subjLen + replyLen
 		payloadLen := dataLen - subjLen - replyLen
 
-		msg := &Msg{
-			frame:       body, // reference batch buffer
-			consumerID:  consumerID,
-			subjectHash: subjectHash,
-			seq:         seq,
-			subjectOff:  subjOff,
-			subjectLen:  subjLen,
-			replyToOff:  replyToOff,
-			replyToLen:  replyLen,
-			payloadOff:  payloadOff,
-			payloadLen:  payloadLen,
-			client:      c,
-			slot:        sub.slot,
-		}
-
-		c.deliverToSub(sub, msg)
+		c.fanOut(rt, body, consumerID, seq, subjOff, subjLen, replyToOff, replyLen, payloadOff, payloadLen)
 		off = entryPayloadStart + totalTail
 	}
-}
-
-func (c *Client) lookupSub(consumerID uint32) *Subscription {
-	val, ok := c.subs.Load(consumerID)
-	if !ok {
-		return nil
-	}
-	return val.(*Subscription)
 }
 
 // confirmAckStoreUpTo drops dedup entries ≤ cursor from the consumer's
@@ -758,11 +784,13 @@ func (c *Client) confirmAckStoreUpTo(consumerID uint32, cursor uint64) {
 	if c.ackStore == nil {
 		return
 	}
-	sub := c.lookupSub(consumerID)
-	if sub == nil || sub.slot == nil {
+	// The slot is per (stream, consumer): siblings share it, so confirming
+	// once through any of them covers the whole group.
+	subs := c.subs.consumerSubs(consumerID)
+	if len(subs) == 0 || subs[0].slot == nil {
 		return
 	}
-	_, _ = sub.slot.ConfirmUpTo(cursor)
+	_, _ = subs[0].slot.ConfirmUpTo(cursor)
 }
 
 func (c *Client) deliverToSub(sub *Subscription, msg *Msg) {
@@ -898,15 +926,17 @@ func (c *Client) replayAckState(newConn *conn.Connection) {
 	}
 	// Durable-dedup consumers with no deferred acks still need the cursor
 	// snapshot (an idle consumer never sees an AckBatchResp).
-	c.subs.Range(func(key, value any) bool {
-		cid := key.(uint32)
-		sub := value.(*Subscription)
+	// One request per CONSUMER, not per subscription: the ack cursor is a
+	// consumer-level fact, and siblings would ask for the same snapshot.
+	c.subs.each(func(sub *Subscription) bool {
+		cid := sub.consumerID
 		if sub.slot == nil {
 			return true
 		}
 		if _, dup := sent[cid]; dup {
 			return true
 		}
+		sent[cid] = struct{}{}
 		var gen uint32
 		if c.ackRelay != nil {
 			gen = c.ackRelay.Generation(cid)
@@ -924,9 +954,9 @@ func (c *Client) replayAckState(newConn *conn.Connection) {
 // expected to still exist server-side (durable by name/group).
 func (c *Client) replaySubscriptions(newConn *conn.Connection) {
 	c.subFilterMu.Lock()
-	snapshot := make(map[uint32][][]byte, len(c.subFilters))
-	for cid, filters := range c.subFilters {
-		snapshot[cid] = filters
+	snapshot := make(map[uint32]subReplay, len(c.subFilters))
+	for subID, entry := range c.subFilters {
+		snapshot[subID] = entry
 	}
 	c.subFilterMu.Unlock()
 
@@ -937,9 +967,11 @@ func (c *Client) replaySubscriptions(newConn *conn.Connection) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	for consumerID, filters := range snapshot {
+	// The sub_id is replayed verbatim: the client owns it, and the routes
+	// that survived the disconnect are keyed by it.
+	for subID, entry := range snapshot {
 		seq := newConn.NextSeq()
-		frame, err := proto.EncodeSubscribe(seq, consumerID, filters)
+		frame, err := proto.EncodeSubscribe(seq, entry.consumerID, subID, entry.filters)
 		if err != nil {
 			continue
 		}
@@ -985,8 +1017,7 @@ func (c *Client) replayCrons(newConn *conn.Connection) {
 // is disabled). It closes every subscription's delivery channel so callers
 // don't block forever on a client that will never recover.
 func (c *Client) failAllPending(_ error) {
-	c.subs.Range(func(key, value any) bool {
-		sub := value.(*Subscription)
+	c.subs.each(func(sub *Subscription) bool {
 		sub.closeLocal()
 		return true
 	})
