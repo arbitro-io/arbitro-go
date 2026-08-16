@@ -41,7 +41,9 @@ type matcher struct {
 }
 
 func newMatcher(filter []byte) matcher {
-	if len(filter) == 0 {
+	// A bare `>` is the catch-all, same as no filter — classifying it as a
+	// pattern would walk tokens to reach the same answer.
+	if len(filter) == 0 || (len(filter) == 1 && filter[0] == '>') {
 		return matcher{kind: matchAll}
 	}
 	if bytes.IndexByte(filter, '*') < 0 && bytes.IndexByte(filter, '>') < 0 {
@@ -65,7 +67,7 @@ func (m *matcher) accepts(subject []byte) bool {
 }
 
 // patternMatch walks pattern and subject token by token. `*` takes exactly
-// one token, `>` takes the rest and must be last. Allocation-free: both
+// one token, `>` takes one or MORE and must be last. Allocation-free: both
 // sides are sliced in place, never split into a slice of tokens.
 func patternMatch(pattern, subject []byte) bool {
 	for {
@@ -74,7 +76,11 @@ func patternMatch(pattern, subject []byte) bool {
 		}
 		pTok, pRest := nextToken(pattern)
 		if len(pTok) == 1 && pTok[0] == '>' {
-			return true
+			// One or more, never zero: `orders.>` does not match the bare
+			// `orders`. Returning true here unconditionally is how this
+			// drifted from the Rust client, which requires a token to be
+			// left.
+			return len(subject) > 0
 		}
 		if len(subject) == 0 {
 			return false
@@ -129,11 +135,20 @@ func newRegistry() *registry {
 
 // register adds a subscription and rebuilds the shared sibling slice for
 // its consumer. Cold path — one allocation per subscribe, none per message.
+//
+// The new slice is a COPY, never an append onto the old one. `lookup`
+// releases the read lock before the caller walks `rt.subs`, so a route
+// handed out a moment ago may still be in use; growing the old slice in
+// place would rewrite the array under that reader.
 func (r *registry) register(sub *Subscription) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	siblings := append(r.byConsu[sub.consumerID], sub)
+	prev := r.byConsu[sub.consumerID]
+	siblings := make([]*Subscription, len(prev)+1)
+	copy(siblings, prev)
+	siblings[len(prev)] = sub
+
 	r.byConsu[sub.consumerID] = siblings
 	r.rebuild(sub.consumerID, siblings)
 }
@@ -163,8 +178,11 @@ func (r *registry) remove(subID uint32) {
 	}
 	delete(r.bySub, subID)
 
+	// Fresh slice, not `siblings[:0]`: compacting in place would rewrite the
+	// array a concurrent fan-out is walking, and would leave the dropped
+	// pointer alive past the new length.
 	siblings := r.byConsu[rt.consumerID]
-	kept := siblings[:0]
+	kept := make([]*Subscription, 0, len(siblings))
 	for _, s := range siblings {
 		if s.id != subID {
 			kept = append(kept, s)
