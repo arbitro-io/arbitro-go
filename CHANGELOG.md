@@ -5,7 +5,7 @@ All notable changes to `arbitro-go` are documented here. Format follows
 as git tags (`vX.Y.Z`); this file is the source of truth for what each tag
 contains.
 
-## [Unreleased]
+## [0.8.0] — 2026-08-17
 
 ### Added — `SubscribeBatch`: N subscriptions in one round-trip
 
