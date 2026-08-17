@@ -51,6 +51,13 @@ contains.
   deadline reached while still waiting for room returns `arbitro.ErrQueueFull`,
   which is transient backpressure, not a dead connection -- the two must
   not be conflated.
+- **A sibling's `>` filter matched differently from the broker's, and one
+  sibling's narrowing leaked into the others.** Local fan-out classified `>`
+  by its own rules instead of the server's, so a subject the broker had
+  accepted for a subscription could be dropped on arrival; and the slice
+  shared between siblings was rewritten in place while routing, so whichever
+  sibling ran first decided what the rest saw. Matching now follows the
+  server and the shared slice is left alone.
 
 ## [0.7.1] - 2026-08-08
 
