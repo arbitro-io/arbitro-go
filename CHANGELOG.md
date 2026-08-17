@@ -7,6 +7,29 @@ contains.
 
 ## [Unreleased]
 
+### Added — `SubscribeBatch`: N subscriptions in one round-trip
+
+- **`Client.SubscribeBatch(ctx, stream, cfg, entries)`** opens N filtered
+  subscriptions on one consumer in a SINGLE round-trip. A hundred `Subscribe`
+  calls cost a hundred round-trips; the broker's work per subscription is a
+  filter check and a binding, so the trip is nearly the whole cost. Every
+  entry runs the same admission rules as `Subscribe`.
+  ```go
+  subs, err := c.SubscribeBatch(ctx, "orders", cfg, []arbitro.BatchSubscribeEntry{
+      {Filter: "orders.premium.*", Handler: onPremium},
+      {Filter: "orders.pay.*",     Handler: onPay},
+      {Handler: onAll},  // no Filter — inherits the consumer's
+  })
+  ```
+- Refused entries return **`*SubscribeBatchError`**, naming the offending
+  **index**, filter and wire code, and carrying the accepted subscriptions so
+  they can still be closed. A refusal is per entry, not all-or-nothing.
+- Adds the four catalog error codes the broker has emitted since the admission
+  rules landed and no client could name: `ErrCodeInvalidStreamFilter`,
+  `ErrCodeStreamFilterConflict`, `ErrCodeInvalidConsumerFilter`,
+  `ErrCodeInvalidSubscriptionFilter`.
+- Requires a broker with `SubscribeBatch` (0x0303). `Subscribe` is unchanged.
+
 ### Breaking
 - **`Client.PublishAsync`, `Stream.PublishAsync`, and `Client.PublishBatchAsync`
   now return `error`.** They used to return nothing -- a failed enqueue was

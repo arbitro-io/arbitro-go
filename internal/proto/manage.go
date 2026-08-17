@@ -63,6 +63,69 @@ func EncodeSubscribe(seq uint64, consumerID, subID uint32, filters [][]byte) ([]
 	})
 }
 
+// --- SubscribeBatch ---
+
+// MaxSubscribeBatch mirrors the broker's cap. Over it the broker answers a
+// single RepError rather than a partial result.
+const MaxSubscribeBatch = 1024
+
+type subscribeBatchPayload struct {
+	Entries []subscribePayload `json:"entries"`
+}
+
+// SubscribeBatchEntry is one subscription inside a SubscribeBatch frame.
+type SubscribeBatchEntry struct {
+	ConsumerID uint32
+	SubID      uint32
+	Filters    [][]byte
+}
+
+// EncodeSubscribeBatch builds a SubscribeBatch frame — N subscriptions in one
+// round-trip. Entries are exactly the single-Subscribe body, so the broker
+// runs them through the identical admission rules; the batch buys a trip,
+// never a different contract. ConsumerID is per entry.
+func EncodeSubscribeBatch(seq uint64, entries []SubscribeBatchEntry) ([]byte, error) {
+	payload := subscribeBatchPayload{Entries: make([]subscribePayload, len(entries))}
+	for i, e := range entries {
+		f := make([][]int, len(e.Filters))
+		for j, flt := range e.Filters {
+			f[j] = bytesArr(flt)
+		}
+		payload.Entries[i] = subscribePayload{
+			ConsumerID:     e.ConsumerID,
+			SubscriptionID: e.SubID,
+			Filters:        f,
+		}
+	}
+	return packCold(ActionSubscribeBatch, seq, payload)
+}
+
+// SubscribeReject names one refused entry of a SubscribeBatch.
+type SubscribeReject struct {
+	SubscriptionID uint32 `json:"subscription_id"`
+	Code           uint16 `json:"code"`
+}
+
+// SubscribeBatchReply is the decoded RepSubscribeBatch body.
+//
+// Only REJECTIONS are listed: the client allocated every subscription id
+// before sending, so an id absent from Errors was accepted. FanoutConsumers
+// carries what bit 63 of the single-subscribe ref_seq carries — which of
+// these consumers deliver in fanout mode, which this client must know or it
+// silently stops fanning out locally.
+type SubscribeBatchReply struct {
+	OK              uint32            `json:"ok"`
+	Errors          []SubscribeReject `json:"errors"`
+	FanoutConsumers []uint32          `json:"fanout_consumers"`
+}
+
+// DecodeSubscribeBatchReply parses a RepSubscribeBatch body (post-Header).
+func DecodeSubscribeBatchReply(body []byte) (SubscribeBatchReply, error) {
+	var r SubscribeBatchReply
+	err := json.Unmarshal(body, &r)
+	return r, err
+}
+
 type unsubscribePayload struct {
 	ConsumerID uint32 `json:"consumer_id"`
 }

@@ -528,6 +528,186 @@ type subReplay struct {
 	filters    [][]byte
 }
 
+// BatchSubscribeEntry is one filtered subscription inside a SubscribeBatch.
+// An empty Filter inherits the consumer's, exactly as a plain Subscribe does.
+type BatchSubscribeEntry struct {
+	Filter  string
+	Handler func(*Msg)
+}
+
+// SubscribeBatchFailure names one entry the broker refused.
+type SubscribeBatchFailure struct {
+	// Index in the slice the caller passed.
+	Index  int
+	Filter string
+	// Wire error code — usually ErrCodeInvalidSubscriptionFilter.
+	Code uint16
+}
+
+// SubscribeBatch opens N filtered subscriptions on one consumer in a SINGLE
+// round-trip.
+//
+// A hundred Subscribe calls cost a hundred round-trips; the broker's work per
+// subscription is a filter check and a binding, so the trip is nearly the
+// whole cost. Every entry runs the same admission rules as Subscribe — the
+// batch buys a trip, not a different contract.
+//
+// Returns the accepted subscriptions in the order requested. If the broker
+// refused any entry, the error is *SubscribeBatchError, which names the
+// offending indices and carries the accepted subscriptions so they can still
+// be closed. A refused entry means its filter escapes the consumer's slice —
+// a wiring mistake, not a runtime condition.
+//
+// The wire carries a consumer_id per entry, so a future variant could span
+// several consumers. This one does not: that would need an ensureConsumer
+// round-trip apiece, which is the cost being removed.
+func (c *Client) SubscribeBatch(
+	ctx context.Context, stream string, cfg ConsumerConfig, entries []BatchSubscribeEntry,
+) ([]*Subscription, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if len(entries) > proto.MaxSubscribeBatch {
+		return nil, &ArbitroError{
+			Code:    ErrCodeInvalidEntryCount,
+			Message: "subscribe batch: too many entries",
+		}
+	}
+
+	consumerID, err := c.ensureConsumer(ctx, stream, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	var slot ackstore.SlotRef
+	if c.ackStore != nil {
+		consumerName := cfg.Name
+		if consumerName == "" {
+			consumerName = stream
+		}
+		if s, serr := c.ackStore.Slot(c.prefixed(stream), consumerName); serr == nil {
+			slot = s
+		}
+	}
+
+	// Subscriptions registered BEFORE the frame goes out, for the reason
+	// Subscribe documents: the broker serves each backlog as soon as it
+	// processes the entry, and those deliveries can outrun the reply.
+	subs := make([]*Subscription, len(entries))
+	wire := make([]proto.SubscribeBatchEntry, len(entries))
+	for i, e := range entries {
+		filterText := e.Filter
+		if filterText == "" {
+			filterText = cfg.Filter
+		}
+		var filters [][]byte
+		if filterText != "" {
+			filters = [][]byte{[]byte(c.prefixed(filterText))}
+		}
+		sub := &Subscription{
+			client:     c,
+			id:         c.allocSubID(),
+			consumerID: consumerID,
+			ch:         make(chan *Msg, subChanCap),
+			handler:    e.Handler,
+			closed:     make(chan struct{}),
+			slot:       slot,
+		}
+		if len(filters) > 0 {
+			sub.match = newMatcher(filters[0])
+		}
+		c.registerSubscription(sub, filters)
+		c.activeSubs.Add(1)
+		subs[i] = sub
+		wire[i] = proto.SubscribeBatchEntry{
+			ConsumerID: consumerID, SubID: sub.id, Filters: filters,
+		}
+	}
+
+	dropAll := func() {
+		for _, sub := range subs {
+			c.unregisterSubscription(sub.id)
+			c.activeSubs.Add(^uint64(0)) // decrement
+		}
+	}
+
+	cn := c.getConn()
+	seq := cn.NextSeq()
+	frame, err := proto.EncodeSubscribeBatch(seq, wire)
+	if err != nil {
+		dropAll()
+		return nil, err
+	}
+	reply, err := cn.SendExpectReply(ctx, frame, seq)
+	if err != nil {
+		// A whole-frame refusal: no entry has a verdict of its own, so none
+		// of these routes may survive.
+		dropAll()
+		return nil, err
+	}
+	if len(reply) < proto.HeaderSize {
+		dropAll()
+		return nil, &ArbitroError{
+			Code: ErrCodeInternalError, Message: "subscribe batch: reply too short",
+		}
+	}
+	body, derr := proto.DecodeSubscribeBatchReply(reply[proto.HeaderSize:])
+	if derr != nil {
+		dropAll()
+		return nil, &ArbitroError{
+			Code: ErrCodeInternalError, Message: "subscribe batch: malformed reply",
+		}
+	}
+
+	// The reply names only failures — this client allocated every id, so an
+	// id absent from Errors was accepted.
+	rejected := make(map[uint32]uint16, len(body.Errors))
+	for _, e := range body.Errors {
+		rejected[e.SubscriptionID] = e.Code
+	}
+	fanout := make(map[uint32]bool, len(body.FanoutConsumers))
+	for _, id := range body.FanoutConsumers {
+		fanout[id] = true
+	}
+	c.subs.setFanout(consumerID, fanout[consumerID])
+
+	accepted := make([]*Subscription, 0, len(subs))
+	var failures []SubscribeBatchFailure
+	for i, sub := range subs {
+		code, bad := rejected[sub.id]
+		if !bad {
+			accepted = append(accepted, sub)
+			continue
+		}
+		// A rejected entry has no binding on the broker; leaving its route
+		// behind would strand deliveries meant for a sibling.
+		c.unregisterSubscription(sub.id)
+		c.activeSubs.Add(^uint64(0)) // decrement
+		filterText := entries[i].Filter
+		if filterText == "" {
+			filterText = cfg.Filter
+		}
+		failures = append(failures, SubscribeBatchFailure{
+			Index: i, Filter: filterText, Code: code,
+		})
+	}
+
+	// One cursor request for the consumer, not one per subscription — the
+	// ackstore slot is keyed by consumer.
+	if slot != nil && len(accepted) > 0 {
+		var gen uint32
+		if c.ackRelay != nil {
+			gen = c.ackRelay.Generation(consumerID)
+		}
+		_ = cn.TrySend(proto.EncodeAckStateReq(cn.NextSeq(), consumerID, gen))
+	}
+
+	if len(failures) > 0 {
+		return nil, &SubscribeBatchError{Failures: failures, Accepted: accepted}
+	}
+	return accepted, nil
+}
+
 // allocSubID hands out the next subscription id for this connection.
 // Starts at 1 — zero is the wire's "unnamed" sentinel.
 func (c *Client) allocSubID() uint32 {

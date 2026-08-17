@@ -51,6 +51,13 @@ const (
 	// stream inside idempotency_window_ms. The message was NOT stored, and
 	// the original write is what survives — safe to treat as success.
 	ErrCodeIdempotencyDuplicate uint16 = 0x0206
+	// The stream's own filter is unusable — absent, or a bare ">" that would
+	// claim every subject and leave no slice for any other stream. Nothing
+	// was created. Distinct from ErrCodeStreamFilterConflict, which is about
+	// a filter that is fine alone but collides with a peer.
+	ErrCodeInvalidStreamFilter uint16 = 0x0207
+	// The stream's filter collides with a slice another stream already owns.
+	ErrCodeStreamFilterConflict uint16 = 0x0208
 
 	// 0x03xx — consumer
 	ErrCodeConsumerNotFound      uint16 = 0x0301
@@ -58,6 +65,13 @@ const (
 	// The CreateConsumer request carried an unusable configuration (most
 	// often an empty group, which is mandatory). The consumer was NOT created.
 	ErrCodeInvalidConsumerConfig uint16 = 0x0304
+	// The consumer's filter reaches outside its stream's slice, or nests
+	// strictly inside a sibling consumer's. The consumer was NOT created.
+	ErrCodeInvalidConsumerFilter uint16 = 0x0305
+	// The subscription's filter reaches outside its consumer's, or the
+	// subscription arrived without an id of its own. Nothing was created.
+	// This is what names a refused entry inside a SubscribeBatch reply.
+	ErrCodeInvalidSubscriptionFilter uint16 = 0x0306
 
 	// 0x05xx — system
 	ErrCodeServerShuttingDown uint16 = 0x0501
@@ -86,12 +100,33 @@ var codeMessages = map[uint16]string{
 	ErrCodeIdempotencyDuplicate:  "duplicate message (idempotency window)",
 	ErrCodeConsumerNotFound:      "consumer not found",
 	ErrCodeConsumerAlreadyExists: "consumer already exists",
+	ErrCodeInvalidStreamFilter:   "stream filter unusable (absent, or a bare '>')",
+	ErrCodeStreamFilterConflict:  "stream filter collides with a slice another stream owns",
 	ErrCodeInvalidConsumerConfig: "invalid consumer config",
+	ErrCodeInvalidConsumerFilter: "consumer filter reaches outside its stream's slice",
+
+	ErrCodeInvalidSubscriptionFilter: "subscription filter reaches outside its consumer's",
 	ErrCodeServerShuttingDown:    "server shutting down",
 	ErrCodeInternalError:         "internal server error",
 	ErrCodeUnimplemented:         "action not implemented in this build",
 	ErrCodeTimeout:               "request timed out",
 	ErrCodeInvalidConfig:         "invalid client config",
+}
+
+// SubscribeBatchError is returned by SubscribeBatch when the broker refused
+// entries. The accepted subscriptions ride along so the caller can still
+// close them — a refusal is per entry, not all-or-nothing.
+type SubscribeBatchError struct {
+	Failures []SubscribeBatchFailure
+	Accepted []*Subscription
+}
+
+func (e *SubscribeBatchError) Error() string {
+	first := e.Failures[0]
+	return fmt.Sprintf(
+		"subscribe batch: %d of %d entries refused (first: index %d, filter %q, code 0x%04x)",
+		len(e.Failures), len(e.Failures)+len(e.Accepted), first.Index, first.Filter, first.Code,
+	)
 }
 
 // ArbitroError represents an error from the broker or client.

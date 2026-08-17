@@ -43,6 +43,10 @@ const (
 	// Subscribe (cold path, JSON body)
 	ActionSubscribe   uint16 = 0x0301
 	ActionUnsubscribe uint16 = 0x0302
+	// N subscriptions in one round-trip; reply is ActionRepSubscribeBatch,
+	// or a single RepError when the whole frame is unusable.
+	ActionSubscribeBatch    uint16 = 0x0303
+	ActionRepSubscribeBatch uint16 = 0x0304
 
 	// Stream management (cold path, JSON body)
 	ActionCreateStream  uint16 = 0x0401
